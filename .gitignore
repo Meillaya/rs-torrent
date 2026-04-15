@@ -12,3 +12,6 @@ target/
 .vscode
 
 .sh
+
+# Local oh-my-codex / session artifacts
+.omx/
