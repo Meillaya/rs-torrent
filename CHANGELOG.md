@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.1.2
+
+### Fixed
+- Aligned the release tag line with the current master branch after the 0.1.1 binary rename follow-up
+- Synchronized Cargo metadata and lockfile state for the renamed `rs-torrent` binary release
+
 ## v0.1.1
 
 ### Changed
