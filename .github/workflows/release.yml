@@ -41,8 +41,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run live acceptance checks when secrets are configured
-        if: ${{ secrets.RS_TORRENT_LIVE_TORRENT != '' && secrets.RS_TORRENT_LIVE_MAGNET != '' && secrets.RS_TORRENT_LIVE_RESUME_SOURCE != '' && secrets.RS_TORRENT_LIVE_MULTI_FILE_TORRENT != '' && secrets.RS_TORRENT_LIVE_UDP_TORRENT != '' }}
-        run: ./scripts/release-readiness.sh --with-live
+        run: |
+          if [ -n "${RS_TORRENT_LIVE_TORRENT}" ] && \
+             [ -n "${RS_TORRENT_LIVE_MAGNET}" ] && \
+             [ -n "${RS_TORRENT_LIVE_RESUME_SOURCE}" ] && \
+             [ -n "${RS_TORRENT_LIVE_MULTI_FILE_TORRENT}" ] && \
+             [ -n "${RS_TORRENT_LIVE_UDP_TORRENT}" ]; then
+            ./scripts/release-readiness.sh --with-live
+          else
+            echo "[release] live acceptance skipped because one or more RS_TORRENT_LIVE_* secrets are not configured"
+          fi
 
   release:
     needs: verify
