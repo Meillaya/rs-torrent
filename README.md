@@ -72,6 +72,18 @@ Download a full file from a torrent:
 cargo run -- download -o output.bin sample.torrent
 ```
 
+For a multi-file torrent, pass a destination root directory instead of a final file path:
+
+```bash
+cargo run -- download -o ./downloads path/to/multi-file.torrent
+```
+
+That will materialize the torrent under:
+
+```text
+./downloads/<torrent-root-name>/
+```
+
 Download a single piece:
 
 ```bash
@@ -90,6 +102,8 @@ Download from a magnet link:
 cargo run -- magnet_download -o output.bin 'magnet:?xt=urn:btih:<info-hash>&tr=http://tracker.example/announce'
 ```
 
+Trackers may now be HTTP(S) or UDP, and multiple `tr=` parameters are preserved from magnet links.
+
 ## Resume behavior
 
 Full-file downloads write to a temporary part file and a JSON resume sidecar.
@@ -100,6 +114,8 @@ Full-file downloads write to a temporary part file and a JSON resume sidecar.
 ```
 
 On restart, the downloader reloads the saved state, re-validates completed pieces, discards corrupted partial data, and resumes only the missing pieces.
+
+For multi-file torrents, pieces are still stored contiguously during download and then finalized into a safe file tree under the chosen destination root.
 
 ## Progress output
 
@@ -139,6 +155,8 @@ Set one or more environment variables:
 export RS_TORRENT_LIVE_TORRENT='<torrent-file-or-url>'
 export RS_TORRENT_LIVE_MAGNET='magnet:?xt=urn:btih:...'
 export RS_TORRENT_LIVE_RESUME_SOURCE='<torrent-or-magnet-source>'
+export RS_TORRENT_LIVE_MULTI_FILE_TORRENT='<multi-file torrent source>'
+export RS_TORRENT_LIVE_UDP_TORRENT='<torrent source backed by UDP trackers>'
 ```
 
 Run the ignored live suite:
@@ -151,4 +169,10 @@ cargo test --test live_acceptance -- --ignored
 
 Piece availability is sampled from peer bitfields at startup and updated from some peer state changes, but it is not yet a fully adaptive production scheduler.
 
-Live-swarm validation is opt-in rather than part of the default local test path.
+UDP tracker support is intentionally conservative. The client can speak to UDP trackers and validates core packet semantics, but it does not yet try to aggressively optimize connection reuse.
+
+Live-swarm validation is opt-in rather than part of the default local test path, so real-world swarm confidence still depends on running the ignored acceptance tests before release or personal use.
+
+Magnet downloads still depend on tracker-backed discovery. Because DHT / PEX / LSD remain out of scope, magnets without useful tracker coverage may still fail even when the protocol implementation is otherwise correct.
+
+The multi-file finalize path is now staged and path-safe, but it still uses one contiguous `.part` payload internally. That keeps the implementation simple and correct, but it is not yet tuned for very large torrents or highly optimized disk behavior.

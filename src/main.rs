@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         }
         Command::MagnetParse { magnet_link } => {
             let parsed_magnet = magnet::Magnet::parse(&magnet_link)?;
-            if let Some(tracker_url) = parsed_magnet.tracker_url {
+            for tracker_url in &parsed_magnet.trackers {
                 println!("Tracker URL: {}", tracker_url);
             }
             println!("Info Hash: {}", parsed_magnet.info_hash);
@@ -69,7 +69,10 @@ async fn main() -> Result<()> {
 }
 
 fn print_torrent_info(info: &TorrentInfo) {
-    println!("Tracker URL: {}", info.announce);
+    println!(
+        "Tracker URL: {}",
+        info.trackers.first().cloned().unwrap_or_default()
+    );
     println!("Length: {}", info.length);
     println!("Info Hash: {}", info.info_hash);
     println!("Piece Length: {}", info.piece_length);
@@ -87,7 +90,7 @@ async fn magnet_info(magnet_link: &str) -> Result<()> {
     let peer_id: [u8; 20] = peer_id::generate_peer_id();
 
     let torrent_info = TorrentInfo::from_magnet(&parsed_magnet)?;
-    let tracker_response = TrackerResponse::query_with_url(&torrent_info, &info_hash).await?;
+    let tracker_response = TrackerResponse::query(&torrent_info, &info_hash).await?;
 
     if tracker_response.peers.0.is_empty() {
         return Err(TorrentError::NoPeersAvailable);
@@ -104,7 +107,7 @@ async fn magnet_info(magnet_link: &str) -> Result<()> {
 
     println!(
         "Tracker URL: {}",
-        parsed_magnet.tracker_url.unwrap_or_default()
+        parsed_magnet.trackers.first().cloned().unwrap_or_default()
     );
     println!("Length: {}", validated_info.length);
     println!("Info Hash: {}", validated_info.info_hash);
@@ -122,7 +125,7 @@ async fn magnet_handshake(magnet_link: &str) -> Result<()> {
     let info_hash = source::parse_info_hash(&parsed_magnet.info_hash)?;
 
     let torrent_info = TorrentInfo::from_magnet(&parsed_magnet)?;
-    let tracker_response = TrackerResponse::query_with_url(&torrent_info, &info_hash).await?;
+    let tracker_response = TrackerResponse::query(&torrent_info, &info_hash).await?;
 
     if tracker_response.peers.0.is_empty() {
         return Err(TorrentError::NoPeersAvailable);

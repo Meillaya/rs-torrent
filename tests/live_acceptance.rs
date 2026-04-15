@@ -125,3 +125,58 @@ fn live_resume_smoke() {
     let metadata = std::fs::metadata(&output).expect("resumed output should exist");
     assert!(metadata.len() > 0, "resumed output should be non-empty");
 }
+
+#[test]
+#[ignore = "requires RS_TORRENT_LIVE_MULTI_FILE_TORRENT and network access"]
+fn live_multi_file_torrent_smoke() {
+    let Some(source) = maybe_env("RS_TORRENT_LIVE_MULTI_FILE_TORRENT") else {
+        eprintln!("skipping: RS_TORRENT_LIVE_MULTI_FILE_TORRENT not set");
+        return;
+    };
+
+    let dir = tempdir().expect("tempdir should exist");
+    let output_root = dir.path().join("multi-file-root");
+    let result = run_download(&output_root, &source);
+
+    assert!(
+        result.status.success(),
+        "multi-file torrent download failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let metadata = std::fs::metadata(&output_root).expect("output root should exist");
+    assert!(
+        metadata.is_dir(),
+        "multi-file output target should be a directory"
+    );
+    let entries = std::fs::read_dir(&output_root)
+        .expect("output root should be readable")
+        .count();
+    assert!(entries > 0, "multi-file output root should not be empty");
+    if let Some(root_name) = maybe_env("RS_TORRENT_LIVE_MULTI_FILE_ROOT") {
+        assert!(
+            output_root.join(root_name).exists(),
+            "expected multi-file root directory was not created"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires RS_TORRENT_LIVE_UDP_TORRENT and network access"]
+fn live_udp_tracker_torrent_smoke() {
+    let Some(source) = maybe_env("RS_TORRENT_LIVE_UDP_TORRENT") else {
+        eprintln!("skipping: RS_TORRENT_LIVE_UDP_TORRENT not set");
+        return;
+    };
+
+    let dir = tempdir().expect("tempdir should exist");
+    let output = dir.path().join("live-udp.bin");
+    let result = run_download(&output, &source);
+
+    assert!(
+        result.status.success(),
+        "udp tracker torrent download failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let metadata = std::fs::metadata(&output).expect("downloaded output should exist");
+    assert!(metadata.len() > 0, "downloaded output should be non-empty");
+}

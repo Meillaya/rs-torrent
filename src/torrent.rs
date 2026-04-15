@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_bencode::de::from_bytes;
 use sha1::{Digest, Sha1};
 use std::fs;
+use std::path::{Component, Path, PathBuf};
 // use std::sync::Arc;
 
 pub use hashes::Hashes;
@@ -13,6 +14,8 @@ pub use hashes::Hashes;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Torrent {
     pub announce: String,
+    #[serde(rename = "announce-list", default)]
+    pub announce_list: Vec<Vec<String>>,
     pub info: Info,
 }
 
@@ -23,6 +26,17 @@ impl Torrent {
         let mut hasher = Sha1::new();
         hasher.update(&info_encoded);
         hasher.finalize().into()
+    }
+
+    pub fn trackers(&self) -> Vec<String> {
+        let mut trackers = Vec::new();
+        push_tracker(&mut trackers, self.announce.clone());
+        for tier in &self.announce_list {
+            for tracker in tier {
+                push_tracker(&mut trackers, tracker.clone());
+            }
+        }
+        trackers
     }
 }
 
@@ -111,12 +125,32 @@ pub fn decode_file(file_path: &str) -> Result<Torrent> {
 }
 #[derive(Clone)]
 pub struct TorrentInfo {
-    pub announce: String,
+    pub trackers: Vec<String>,
     pub info_hash: String,
     pub length: i64,
     pub name: String,
     pub piece_length: i64,
     pub pieces: Vec<[u8; 20]>,
+    pub layout: Option<TorrentLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TorrentLayout {
+    SingleFile {
+        suggested_name: String,
+        length: usize,
+    },
+    MultiFile {
+        root_name: String,
+        files: Vec<TorrentLayoutFile>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentLayoutFile {
+    pub relative_path: PathBuf,
+    pub length: usize,
+    pub offset: usize,
 }
 
 impl TorrentInfo {
@@ -133,6 +167,36 @@ impl TorrentInfo {
             Keys::MultiFile { files } => files.iter().map(|f| f.length as i64).sum(),
         }
     }
+
+    pub fn build_layout(info: &Info) -> Result<TorrentLayout> {
+        match &info.keys {
+            Keys::SingleFile { length } => Ok(TorrentLayout::SingleFile {
+                suggested_name: info.name.clone(),
+                length: *length,
+            }),
+            Keys::MultiFile { files } => {
+                let root_name = validate_path_component(&info.name)?;
+                let mut offset = 0usize;
+                let mut layout_files = Vec::with_capacity(files.len());
+
+                for file in files {
+                    let relative_path = validate_relative_path(&file.path)?;
+                    layout_files.push(TorrentLayoutFile {
+                        relative_path,
+                        length: file.length,
+                        offset,
+                    });
+                    offset += file.length;
+                }
+
+                Ok(TorrentLayout::MultiFile {
+                    root_name,
+                    files: layout_files,
+                })
+            }
+        }
+    }
+
     pub fn validate_metadata(metadata: &[u8], expected_info_hash: &str) -> Result<Self> {
         let info: Info = serde_bencode::from_bytes(metadata)?;
         let calculated_info_hash = hex::encode(Self::calculate_info_hash(&info));
@@ -141,23 +205,27 @@ impl TorrentInfo {
             return Err(TorrentError::InvalidInfoHash);
         }
 
+        let layout = Self::build_layout(&info)?;
+        let name = info.name.clone();
         Ok(TorrentInfo {
-            announce: String::new(), // We don't have this information from metadata
+            trackers: Vec::new(),
             info_hash: calculated_info_hash,
             length: Self::calculate_length(&info),
-            name: info.name,
+            name,
             piece_length: info.piece_length as i64,
             pieces: info.pieces.0,
+            layout: Some(layout),
         })
     }
     pub fn from_magnet(magnet: &magnet::Magnet) -> Result<Self> {
         Ok(TorrentInfo {
-            announce: magnet.tracker_url.clone().unwrap_or_default(),
+            trackers: magnet.trackers.clone(),
             info_hash: magnet.info_hash.clone(),
             length: 0, // Length is unknown from magnet link
             name: magnet.display_name.clone().unwrap_or_default(),
             piece_length: 0,    // Unknown from magnet link
             pieces: Vec::new(), // Unknown from magnet link
+            layout: None,
         })
     }
 }
@@ -167,14 +235,17 @@ pub fn get_info(file_path: &str) -> Result<TorrentInfo> {
 
     let info_hash = torrent.info_hash();
     let length = TorrentInfo::calculate_length(&torrent.info);
+    let layout = TorrentInfo::build_layout(&torrent.info)?;
+    let name = torrent.info.name.clone();
 
     Ok(TorrentInfo {
-        announce: torrent.announce,
+        trackers: torrent.trackers(),
         info_hash: hex::encode(info_hash),
         length,
-        name: torrent.info.name,
+        name,
         piece_length: torrent.info.piece_length as i64,
         pieces: torrent.info.pieces.0,
+        layout: Some(layout),
     })
 }
 
@@ -196,9 +267,57 @@ pub fn verify_piece(info: &TorrentInfo, piece_index: usize, piece_data: &[u8]) -
     }
 }
 
+fn validate_path_component(component: &str) -> Result<String> {
+    if component.is_empty() || component == "." || component == ".." {
+        return Err(TorrentError::InvalidResponseFormat(
+            "Unsafe torrent path component".into(),
+        ));
+    }
+
+    if component.contains('/') || component.contains('\\') {
+        return Err(TorrentError::InvalidResponseFormat(
+            "Torrent path component contains a separator".into(),
+        ));
+    }
+
+    let path = Path::new(component);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(component.to_string()),
+        _ => Err(TorrentError::InvalidResponseFormat(
+            "Unsafe torrent path component".into(),
+        )),
+    }
+}
+
+fn validate_relative_path(segments: &[String]) -> Result<PathBuf> {
+    if segments.is_empty() {
+        return Err(TorrentError::InvalidResponseFormat(
+            "Multi-file path is empty".into(),
+        ));
+    }
+
+    let mut path = PathBuf::new();
+    for segment in segments {
+        path.push(validate_path_component(segment)?);
+    }
+    Ok(path)
+}
+
+fn push_tracker(trackers: &mut Vec<String>, tracker: String) {
+    if tracker.is_empty() || trackers.contains(&tracker) {
+        return;
+    }
+    trackers.push(tracker);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode_file, get_info, verify_piece, Keys, TorrentInfo};
+    use super::{
+        decode_file, get_info, validate_relative_path, verify_piece, Keys, Torrent, TorrentInfo,
+        TorrentLayout,
+    };
+    use std::path::PathBuf;
 
     fn sample_torrent_path() -> String {
         format!("{}/sample.torrent", env!("CARGO_MANIFEST_DIR"))
@@ -214,6 +333,10 @@ mod tests {
         );
         assert_eq!(torrent.info.name, "sample.txt");
         assert_eq!(torrent.info.pieces.0.len(), 3);
+        assert_eq!(
+            torrent.trackers(),
+            vec!["http://bittorrent-test-tracker.codecrafters.io/announce"]
+        );
         assert!(matches!(
             torrent.info.keys,
             Keys::SingleFile { length: 92063 }
@@ -228,6 +351,14 @@ mod tests {
         assert_eq!(info.length, 92063);
         assert_eq!(info.piece_length, 32768);
         assert_eq!(info.pieces.len(), 3);
+        assert_eq!(
+            info.trackers,
+            vec!["http://bittorrent-test-tracker.codecrafters.io/announce"]
+        );
+        assert!(matches!(
+            info.layout,
+            Some(TorrentLayout::SingleFile { .. })
+        ));
     }
 
     #[test]
@@ -258,5 +389,50 @@ mod tests {
         };
 
         assert_eq!(TorrentInfo::calculate_length(&info), 25);
+        let layout = TorrentInfo::build_layout(&info).expect("multi-file layout should build");
+        match layout {
+            TorrentLayout::MultiFile { root_name, files } => {
+                assert_eq!(root_name, "bundle");
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0].relative_path, PathBuf::from("a"));
+                assert_eq!(files[0].offset, 0);
+                assert_eq!(files[1].relative_path, PathBuf::from("b"));
+                assert_eq!(files[1].offset, 10);
+            }
+            _ => panic!("expected multi-file layout"),
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_multi_file_paths() {
+        assert!(validate_relative_path(&["..".into(), "evil".into()]).is_err());
+        assert!(validate_relative_path(&["nested/file".into()]).is_err());
+    }
+
+    #[test]
+    fn preserves_multiple_trackers_from_torrent_metadata() {
+        let torrent = Torrent {
+            announce: "http://tracker.one/announce".into(),
+            announce_list: vec![
+                vec!["http://tracker.two/announce".into()],
+                vec!["udp://tracker.three:6969/announce".into()],
+                vec!["http://tracker.one/announce".into()],
+            ],
+            info: super::Info {
+                name: "file.bin".into(),
+                piece_length: 4,
+                pieces: super::Hashes(vec![[0u8; 20]]),
+                keys: Keys::SingleFile { length: 4 },
+            },
+        };
+
+        assert_eq!(
+            torrent.trackers(),
+            vec![
+                "http://tracker.one/announce",
+                "http://tracker.two/announce",
+                "udp://tracker.three:6969/announce",
+            ]
+        );
     }
 }

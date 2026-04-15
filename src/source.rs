@@ -59,7 +59,7 @@ async fn retrieve_torrent_info_from_magnet(
     info_hash: &[u8; 20],
 ) -> Result<(TorrentInfo, Vec<SocketAddrV4>)> {
     let torrent_info = TorrentInfo::from_magnet(parsed_magnet)?;
-    let tracker_response = TrackerResponse::query_with_url(&torrent_info, info_hash).await?;
+    let tracker_response = TrackerResponse::query(&torrent_info, info_hash).await?;
 
     if tracker_response.peers.0.is_empty() {
         return Err(TorrentError::NoPeersAvailable);

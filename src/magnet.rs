@@ -6,7 +6,7 @@ use url::Url;
 #[derive(Debug)]
 pub struct Magnet {
     pub info_hash: String,
-    pub tracker_url: Option<String>,
+    pub trackers: Vec<String>,
     pub display_name: Option<String>,
 }
 
@@ -19,7 +19,7 @@ impl Magnet {
         }
 
         let mut info_hash = None;
-        let mut tracker_url = None;
+        let mut trackers = Vec::new();
         let mut display_name = None;
 
         for (key, value) in url.query_pairs() {
@@ -29,7 +29,7 @@ impl Magnet {
                         info_hash = Some(stripped.to_string());
                     }
                 }
-                "tr" => tracker_url = Some(value.to_string()),
+                "tr" => trackers.push(value.to_string()),
                 "dn" => display_name = Some(value.to_string()),
                 _ => {}
             }
@@ -39,7 +39,7 @@ impl Magnet {
 
         Ok(Magnet {
             info_hash,
-            tracker_url,
+            trackers,
             display_name,
         })
     }
@@ -53,16 +53,15 @@ mod tests {
     #[test]
     fn parses_common_magnet_fields() {
         let magnet = Magnet::parse(
-            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=example&tr=http://tracker.test/announce",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=example&tr=http://tracker.test/announce&tr=udp://tracker.test:6969/announce",
         )
         .expect("magnet should parse");
 
         assert_eq!(magnet.info_hash, "0123456789abcdef0123456789abcdef01234567");
         assert_eq!(magnet.display_name.as_deref(), Some("example"));
-        assert_eq!(
-            magnet.tracker_url.as_deref(),
-            Some("http://tracker.test/announce")
-        );
+        assert_eq!(magnet.trackers.len(), 2);
+        assert_eq!(magnet.trackers[0], "http://tracker.test/announce");
+        assert_eq!(magnet.trackers[1], "udp://tracker.test:6969/announce");
     }
 
     #[test]

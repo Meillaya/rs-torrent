@@ -1,6 +1,6 @@
 use crate::{
     error::{Result, TorrentError},
-    torrent::{self, TorrentInfo},
+    torrent::{self, TorrentInfo, TorrentLayout, TorrentLayoutFile},
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -9,11 +9,22 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub struct DownloadStorage {
-    output_path: PathBuf,
+    finalize_target: FinalizeTarget,
     part_path: PathBuf,
     state_path: PathBuf,
     file: File,
     state: ResumeState,
+}
+
+#[derive(Debug, Clone)]
+enum FinalizeTarget {
+    SingleFile {
+        output_path: PathBuf,
+    },
+    MultiFile {
+        root_dir: PathBuf,
+        files: Vec<TorrentLayoutFile>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,25 +37,19 @@ struct ResumeState {
 
 impl DownloadStorage {
     pub async fn open<P: AsRef<Path>>(output_path: P, info: &TorrentInfo) -> Result<Self> {
-        let output_path = output_path.as_ref().to_path_buf();
-        let part_path = append_suffix(&output_path, ".part");
-        let state_path = append_suffix(&output_path, ".resume.json");
-
-        if fs::try_exists(&output_path).await?
-            && !fs::try_exists(&part_path).await?
-            && !fs::try_exists(&state_path).await?
-        {
-            return Err(TorrentError::DownloadFailed(format!(
-                "Output path already exists: {}",
-                output_path.display()
-            )));
-        }
-
         if !self_describes_torrent(info) {
             return Err(TorrentError::DownloadFailed(
                 "Torrent metadata is incomplete for storage initialization".into(),
             ));
         }
+
+        let output_path = output_path.as_ref().to_path_buf();
+        let finalize_target = build_finalize_target(&output_path, info)?;
+        let (part_path, state_path) = working_paths(&finalize_target, &output_path, info)?;
+
+        ensure_target_is_available(&finalize_target, &part_path, &state_path).await?;
+        ensure_parent_directory(&part_path).await?;
+        ensure_parent_directory(&state_path).await?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -56,7 +61,7 @@ impl DownloadStorage {
         file.set_len(info.length as u64).await?;
 
         let mut storage = Self {
-            output_path,
+            finalize_target,
             part_path,
             state_path,
             file,
@@ -132,14 +137,44 @@ impl DownloadStorage {
         self.file.flush().await?;
         drop(self.file);
 
-        if fs::try_exists(&self.output_path).await? {
-            return Err(TorrentError::DownloadFailed(format!(
-                "Refusing to overwrite existing file: {}",
-                self.output_path.display()
-            )));
+        match &self.finalize_target {
+            FinalizeTarget::SingleFile { output_path } => {
+                if fs::try_exists(output_path).await? {
+                    return Err(TorrentError::DownloadFailed(format!(
+                        "Refusing to overwrite existing file: {}",
+                        output_path.display()
+                    )));
+                }
+                ensure_parent_directory(output_path).await?;
+                fs::rename(&self.part_path, output_path).await?;
+            }
+            FinalizeTarget::MultiFile { root_dir, files } => {
+                if fs::try_exists(root_dir).await? {
+                    return Err(TorrentError::DownloadFailed(format!(
+                        "Refusing to overwrite existing directory: {}",
+                        root_dir.display()
+                    )));
+                }
+
+                ensure_parent_directory(root_dir).await?;
+                let staging_dir = append_suffix(root_dir, ".staging");
+                if fs::try_exists(&staging_dir).await? {
+                    fs::remove_dir_all(&staging_dir).await?;
+                }
+                fs::create_dir_all(&staging_dir).await?;
+
+                if let Err(err) =
+                    materialize_multi_file_tree(&self.part_path, &staging_dir, files).await
+                {
+                    let _ = fs::remove_dir_all(&staging_dir).await;
+                    return Err(err);
+                }
+
+                fs::rename(&staging_dir, root_dir).await?;
+                fs::remove_file(&self.part_path).await?;
+            }
         }
 
-        fs::rename(&self.part_path, &self.output_path).await?;
         if fs::try_exists(&self.state_path).await? {
             fs::remove_file(&self.state_path).await?;
         }
@@ -231,7 +266,7 @@ impl ResumeState {
 }
 
 fn self_describes_torrent(info: &TorrentInfo) -> bool {
-    info.length > 0 && info.piece_length > 0 && !info.pieces.is_empty()
+    info.length > 0 && info.piece_length > 0 && !info.pieces.is_empty() && info.layout.is_some()
 }
 
 fn piece_offset(info: &TorrentInfo, piece_index: usize) -> Result<usize> {
@@ -258,17 +293,144 @@ fn piece_length_for(info: &TorrentInfo, piece_index: usize) -> Result<usize> {
     }
 }
 
+fn build_finalize_target(output_path: &Path, info: &TorrentInfo) -> Result<FinalizeTarget> {
+    match info
+        .layout
+        .clone()
+        .ok_or_else(|| TorrentError::DownloadFailed("Torrent layout is missing".into()))?
+    {
+        TorrentLayout::SingleFile { .. } => Ok(FinalizeTarget::SingleFile {
+            output_path: output_path.to_path_buf(),
+        }),
+        TorrentLayout::MultiFile { root_name, files } => Ok(FinalizeTarget::MultiFile {
+            root_dir: output_path.join(root_name),
+            files,
+        }),
+    }
+}
+
+fn working_paths(
+    finalize_target: &FinalizeTarget,
+    output_path: &Path,
+    info: &TorrentInfo,
+) -> Result<(PathBuf, PathBuf)> {
+    match finalize_target {
+        FinalizeTarget::SingleFile { output_path } => Ok((
+            append_suffix(output_path, ".part"),
+            append_suffix(output_path, ".resume.json"),
+        )),
+        FinalizeTarget::MultiFile {
+            root_dir: _,
+            files: _,
+        } => {
+            let stem = info.name.clone();
+            Ok((
+                output_path.join(format!("{stem}.part")),
+                output_path.join(format!("{stem}.resume.json")),
+            ))
+        }
+    }
+}
+
+async fn ensure_target_is_available(
+    finalize_target: &FinalizeTarget,
+    part_path: &Path,
+    state_path: &Path,
+) -> Result<()> {
+    match finalize_target {
+        FinalizeTarget::SingleFile { output_path } => {
+            if fs::try_exists(output_path).await?
+                && !fs::try_exists(part_path).await?
+                && !fs::try_exists(state_path).await?
+            {
+                return Err(TorrentError::DownloadFailed(format!(
+                    "Output path already exists: {}",
+                    output_path.display()
+                )));
+            }
+        }
+        FinalizeTarget::MultiFile { root_dir, .. } => {
+            if fs::try_exists(root_dir).await?
+                && !fs::try_exists(part_path).await?
+                && !fs::try_exists(state_path).await?
+            {
+                return Err(TorrentError::DownloadFailed(format!(
+                    "Output root already exists: {}",
+                    root_dir.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_parent_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    Ok(())
+}
+
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut path = path.as_os_str().to_os_string();
     path.push(OsString::from(suffix));
     PathBuf::from(path)
 }
 
+fn is_safe_relative_path(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+
+    path.components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+async fn materialize_multi_file_tree(
+    part_path: &Path,
+    root_dir: &Path,
+    files: &[TorrentLayoutFile],
+) -> Result<()> {
+    let mut source = File::open(part_path).await?;
+    let mut buffer = vec![0u8; 16 * 1024];
+
+    for file in files {
+        if !is_safe_relative_path(&file.relative_path) {
+            return Err(TorrentError::DownloadFailed(
+                "Refusing to materialize unsafe relative path".into(),
+            ));
+        }
+        source
+            .seek(std::io::SeekFrom::Start(file.offset as u64))
+            .await?;
+        let destination = root_dir.join(&file.relative_path);
+        ensure_parent_directory(&destination).await?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&destination)
+            .await?;
+
+        let mut remaining = file.length;
+        while remaining > 0 {
+            let chunk_len = remaining.min(buffer.len());
+            source.read_exact(&mut buffer[..chunk_len]).await?;
+            output.write_all(&buffer[..chunk_len]).await?;
+            remaining -= chunk_len;
+        }
+        output.flush().await?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::DownloadStorage;
-    use crate::torrent::TorrentInfo;
+    use crate::torrent::{TorrentInfo, TorrentLayout, TorrentLayoutFile};
     use sha1::{Digest, Sha1};
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn fake_info() -> TorrentInfo {
@@ -276,13 +438,59 @@ mod tests {
         let piece_b = b"efgh";
 
         TorrentInfo {
-            announce: String::new(),
+            trackers: Vec::new(),
             info_hash: "fake-info-hash".into(),
             length: 8,
             name: "fixture.bin".into(),
             piece_length: 4,
             pieces: vec![sha1_bytes(piece_a), sha1_bytes(piece_b)],
+            layout: Some(TorrentLayout::SingleFile {
+                suggested_name: "fixture.bin".into(),
+                length: 8,
+            }),
         }
+    }
+
+    fn fake_multi_file_info() -> TorrentInfo {
+        let piece_a = b"abcd";
+        let piece_b = b"efgh";
+
+        TorrentInfo {
+            trackers: Vec::new(),
+            info_hash: "fake-multi".into(),
+            length: 8,
+            name: "bundle".into(),
+            piece_length: 4,
+            pieces: vec![sha1_bytes(piece_a), sha1_bytes(piece_b)],
+            layout: Some(TorrentLayout::MultiFile {
+                root_name: "bundle".into(),
+                files: vec![
+                    TorrentLayoutFile {
+                        relative_path: PathBuf::from("a.txt"),
+                        length: 3,
+                        offset: 0,
+                    },
+                    TorrentLayoutFile {
+                        relative_path: PathBuf::from("nested").join("b.txt"),
+                        length: 5,
+                        offset: 3,
+                    },
+                ],
+            }),
+        }
+    }
+
+    fn fake_unsafe_multi_file_info() -> TorrentInfo {
+        let mut info = fake_multi_file_info();
+        info.layout = Some(TorrentLayout::MultiFile {
+            root_name: "bundle".into(),
+            files: vec![TorrentLayoutFile {
+                relative_path: PathBuf::from("..").join("evil.txt"),
+                length: 8,
+                offset: 0,
+            }],
+        });
+        info
     }
 
     fn sha1_bytes(bytes: &[u8]) -> [u8; 20] {
@@ -355,5 +563,94 @@ mod tests {
             .await
             .expect("storage should reopen");
         assert_eq!(resumed.missing_piece_indices(), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn finalizes_multi_file_layout_under_destination_root() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output_root = dir.path().join("downloads");
+        let info = fake_multi_file_info();
+
+        let mut storage = DownloadStorage::open(&output_root, &info)
+            .await
+            .expect("storage should open");
+        storage
+            .write_piece(&info, 0, b"abcd")
+            .await
+            .expect("first piece should write");
+        storage
+            .write_piece(&info, 1, b"efgh")
+            .await
+            .expect("second piece should write");
+        storage.finalize().await.expect("finalize should succeed");
+
+        let first = tokio::fs::read(output_root.join("bundle").join("a.txt"))
+            .await
+            .expect("first file should exist");
+        let second = tokio::fs::read(output_root.join("bundle").join("nested").join("b.txt"))
+            .await
+            .expect("second file should exist");
+
+        assert_eq!(&first, b"abc");
+        assert_eq!(&second, b"defgh");
+        assert!(!output_root.join("bundle.part").exists());
+        assert!(!output_root.join("bundle.resume.json").exists());
+    }
+
+    #[tokio::test]
+    async fn resumes_multi_file_downloads() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output_root = dir.path().join("downloads");
+        let info = fake_multi_file_info();
+
+        let mut storage = DownloadStorage::open(&output_root, &info)
+            .await
+            .expect("storage should open");
+        storage
+            .write_piece(&info, 0, b"abcd")
+            .await
+            .expect("first piece should write");
+        drop(storage);
+
+        let mut resumed = DownloadStorage::open(&output_root, &info)
+            .await
+            .expect("storage should reopen");
+        assert_eq!(resumed.missing_piece_indices(), vec![1]);
+        resumed
+            .write_piece(&info, 1, b"efgh")
+            .await
+            .expect("second piece should write");
+        resumed.finalize().await.expect("finalize should succeed");
+
+        let second = tokio::fs::read(output_root.join("bundle").join("nested").join("b.txt"))
+            .await
+            .expect("second file should exist");
+        assert_eq!(&second, b"defgh");
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_multi_file_layouts() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output_root = dir.path().join("downloads");
+        let info = fake_unsafe_multi_file_info();
+
+        let mut storage = DownloadStorage::open(&output_root, &info)
+            .await
+            .expect("storage should open");
+        storage
+            .write_piece(&info, 0, b"abcd")
+            .await
+            .expect("first piece should write");
+        storage
+            .write_piece(&info, 1, b"efgh")
+            .await
+            .expect("second piece should write");
+
+        let err = storage
+            .finalize()
+            .await
+            .expect_err("unsafe path should fail");
+        assert!(err.to_string().contains("unsafe"));
+        assert!(!output_root.join("evil.txt").exists());
     }
 }
