@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.1.1
+
+### Changed
+- Renamed the release binary from `bittorrent-starter-rust` to `rs-torrent`
+- Updated integration tests and documentation to use the new binary name
+
 ### Added
 - Shared CLI command layer built on `clap`
 - Shared peer ID generation and source-resolution helpers

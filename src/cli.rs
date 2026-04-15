@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "bittorrent-starter-rust", about = "BitTorrent CLI downloader")]
+#[command(name = "rs-torrent", about = "BitTorrent CLI downloader")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

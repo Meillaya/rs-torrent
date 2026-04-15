@@ -1,7 +1,25 @@
+use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_bittorrent-starter-rust"))
+    Command::new(binary_path())
+}
+
+fn binary_path() -> PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_rs-torrent") {
+        return PathBuf::from(path);
+    }
+
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+
+    let exe = if cfg!(windows) {
+        "rs-torrent.exe"
+    } else {
+        "rs-torrent"
+    };
+    target_dir.join("debug").join(exe)
 }
 
 #[test]

@@ -7,9 +7,13 @@
 # DON'T EDIT THIS!
 [package]
 name = "bittorrent-starter-rust"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Codecrafters <hello@codecrafters.io>"]
 edition = "2021"
+
+[[bin]]
+name = "rs-torrent"
+path = "src/main.rs"
 
 # DON'T EDIT THIS!
 #

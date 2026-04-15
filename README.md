@@ -21,7 +21,7 @@ cargo build --release
 The binary will be available at:
 
 ```bash
-./target/release/bittorrent-starter-rust
+./target/release/rs-torrent
 ```
 
 Install it into your Cargo bin directory:
