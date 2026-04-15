@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.1
+
+### Fixed
+- Aligned the release tag line with the current master branch after the 0.2.0 lockfile metadata follow-up
+- Synchronized Cargo metadata and lockfile state for the 0.2.x release line
+
 ## v0.2.0
 
 ### Added
