@@ -121,13 +121,14 @@ impl DownloadStorage {
         self.seek_to_piece(info, piece_index).await?;
         self.file.write_all(data).await?;
         self.file.flush().await?;
+        self.file.sync_data().await?;
 
         self.state.completed_pieces[piece_index] = true;
         self.persist_state().await?;
         Ok(())
     }
 
-    pub async fn finalize(mut self) -> Result<()> {
+    pub async fn finalize(mut self) -> Result<PathBuf> {
         if !self.is_complete() {
             return Err(TorrentError::DownloadFailed(
                 "Cannot finalize incomplete download".into(),
@@ -136,6 +137,7 @@ impl DownloadStorage {
 
         self.file.flush().await?;
         drop(self.file);
+        let finalized_path: PathBuf;
 
         match &self.finalize_target {
             FinalizeTarget::SingleFile { output_path } => {
@@ -147,6 +149,7 @@ impl DownloadStorage {
                 }
                 ensure_parent_directory(output_path).await?;
                 fs::rename(&self.part_path, output_path).await?;
+                finalized_path = output_path.clone();
             }
             FinalizeTarget::MultiFile { root_dir, files } => {
                 if fs::try_exists(root_dir).await? {
@@ -172,13 +175,14 @@ impl DownloadStorage {
 
                 fs::rename(&staging_dir, root_dir).await?;
                 fs::remove_file(&self.part_path).await?;
+                finalized_path = root_dir.clone();
             }
         }
 
         if fs::try_exists(&self.state_path).await? {
             fs::remove_file(&self.state_path).await?;
         }
-        Ok(())
+        Ok(finalized_path)
     }
 
     async fn load_or_initialize_state(&mut self, info: &TorrentInfo) -> Result<()> {
@@ -229,6 +233,7 @@ impl DownloadStorage {
         self.seek_to_piece(info, piece_index).await?;
         self.file.write_all(&vec![0u8; length]).await?;
         self.file.flush().await?;
+        self.file.sync_data().await?;
         Ok(())
     }
 
@@ -242,7 +247,18 @@ impl DownloadStorage {
 
     async fn persist_state(&self) -> Result<()> {
         let encoded = serde_json::to_vec_pretty(&self.state)?;
-        fs::write(&self.state_path, encoded).await?;
+        let tmp_path = append_suffix(&self.state_path, ".tmp");
+        let mut temp = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .await?;
+        temp.write_all(&encoded).await?;
+        temp.flush().await?;
+        temp.sync_data().await?;
+        drop(temp);
+        fs::rename(&tmp_path, &self.state_path).await?;
         Ok(())
     }
 }
@@ -582,7 +598,8 @@ mod tests {
             .write_piece(&info, 1, b"efgh")
             .await
             .expect("second piece should write");
-        storage.finalize().await.expect("finalize should succeed");
+        let finalized = storage.finalize().await.expect("finalize should succeed");
+        assert_eq!(finalized, output_root.join("bundle"));
 
         let first = tokio::fs::read(output_root.join("bundle").join("a.txt"))
             .await
@@ -620,7 +637,8 @@ mod tests {
             .write_piece(&info, 1, b"efgh")
             .await
             .expect("second piece should write");
-        resumed.finalize().await.expect("finalize should succeed");
+        let finalized = resumed.finalize().await.expect("finalize should succeed");
+        assert_eq!(finalized, output_root.join("bundle"));
 
         let second = tokio::fs::read(output_root.join("bundle").join("nested").join("b.txt"))
             .await

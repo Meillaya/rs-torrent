@@ -176,3 +176,15 @@ Live-swarm validation is opt-in rather than part of the default local test path,
 Magnet downloads still depend on tracker-backed discovery. Because DHT / PEX / LSD remain out of scope, magnets without useful tracker coverage may still fail even when the protocol implementation is otherwise correct.
 
 The multi-file finalize path is now staged and path-safe, but it still uses one contiguous `.part` payload internally. That keeps the implementation simple and correct, but it is not yet tuned for very large torrents or highly optimized disk behavior.
+
+## Next major milestones
+
+The next major milestone is a more adaptive scheduler. That would mean better peer scoring, better use of live availability updates, and fewer wasted retries against slow or unreliable peers.
+
+The second milestone is stronger release confidence. The project now has ignored live acceptance tests, but the next step is to turn those into a repeatable release gate with a stable real-world torrent corpus.
+
+The third milestone is richer tracker and magnet resilience. That includes better fallback diagnostics, more operational visibility, and tighter handling for mixed tracker environments.
+
+The fourth milestone is storage and throughput optimization for larger torrents. The current contiguous `.part` strategy is correct and simple, but future work could reduce disk churn and improve large-download efficiency.
+
+The fifth milestone, if the project scope grows, is selective download and richer user control. That would stay below daemon/UI scope, but would make the CLI much more practical for everyday torrent use.

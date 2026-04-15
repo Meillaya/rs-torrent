@@ -29,6 +29,7 @@ pub enum TorrentError {
     NoPeersAvailable,
     UnexpectedMessage(String),
     UnexpectedBlockData,
+    PeerDoesNotAdvertisePiece(usize),
     DownloadFailed(String),
     InvalidMagnetLink,
     ChannelSendError(String),
@@ -65,6 +66,9 @@ impl fmt::Display for TorrentError {
             TorrentError::NoPeersAvailable => write!(f, "No Peers Available"),
             TorrentError::UnexpectedMessage(msg) => write!(f, "Unexpected Message: {}", msg),
             TorrentError::UnexpectedBlockData => write!(f, "Unexpected Block Data"),
+            TorrentError::PeerDoesNotAdvertisePiece(piece_index) => {
+                write!(f, "Peer does not advertise piece {}", piece_index)
+            }
             TorrentError::DownloadFailed(msg) => write!(f, "Download Failed: {}", msg),
             TorrentError::InvalidMagnetLink => write!(f, "Invalid Magnet Link"),
             TorrentError::ChannelSendError(msg) => write!(f, "Channel Send Error: {}", msg),

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v0.2.0
+
+### Added
+- Multi-file torrent layout preservation through the normalized `TorrentInfo` execution model
+- Safe staged multi-file finalization under a destination root
+- UDP tracker support with BEP 15-style connect/announce packet handling
+- Smarter peer-health scheduling with cooldowns, remembered missing pieces, and bounded piece requeue
+- Cooperative interruption handling with durable piece-level resume checkpoints
+- Expanded deterministic coverage for tracker packets, multi-file output, scheduler behavior, and interruption paths
+
+### Changed
+- `.torrent` files now preserve tracker fallback candidates from `announce-list` metadata
+- Tracker querying is transport-agnostic from the caller’s point of view (HTTP and UDP)
+- Full downloads now report clearer finalized-path and interruption state
+
+### Fixed
+- Multi-file finalize now stages output before moving it into place
+- Piece checkpoint durability is stronger through `sync_data()` and atomic resume-state writes
+- Shutdown now stops dequeuing new work at the queue boundary instead of aborting workers
+
 ## v0.1.2
 
 ### Fixed

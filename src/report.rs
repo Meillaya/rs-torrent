@@ -25,6 +25,9 @@ pub enum ProgressEvent<'a> {
     DownloadFinalized {
         output: &'a str,
     },
+    DownloadInterrupted {
+        output: &'a str,
+    },
     PieceWritten {
         piece_index: usize,
         output: &'a str,
@@ -60,6 +63,9 @@ pub fn render_event(event: &ProgressEvent<'_>) -> String {
         ProgressEvent::DownloadFinalized { output } => {
             format!("[progress] finalized download to {output}")
         }
+        ProgressEvent::DownloadInterrupted { output } => format!(
+            "[warn] download interrupted; partial state preserved for resume at {output}"
+        ),
         ProgressEvent::PieceWritten { piece_index, output } => {
             format!("[progress] wrote piece {piece_index} to {output}")
         }
@@ -102,6 +108,18 @@ mod tests {
         assert_eq!(
             rendered,
             "[warn] failed to download piece 3 from 127.0.0.1:6881: timeout"
+        );
+    }
+
+    #[test]
+    fn renders_interruption_message() {
+        let rendered = render_event(&ProgressEvent::DownloadInterrupted {
+            output: "output.bin",
+        });
+
+        assert_eq!(
+            rendered,
+            "[warn] download interrupted; partial state preserved for resume at output.bin"
         );
     }
 }

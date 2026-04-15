@@ -46,7 +46,10 @@ async fn main() -> Result<()> {
             download::download_piece(&args.output_file, &args.source, args.piece_index).await?;
         }
         Command::Download(args) => {
-            download::download_file(&args.output_file, &args.source).await?;
+            download::download_file_with_shutdown(&args.output_file, &args.source, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
         }
         Command::MagnetParse { magnet_link } => {
             let parsed_magnet = magnet::Magnet::parse(&magnet_link)?;
@@ -61,7 +64,10 @@ async fn main() -> Result<()> {
             download::download_piece(&args.output_file, &args.source, args.piece_index).await?;
         }
         Command::MagnetDownload(args) => {
-            download::download_file(&args.output_file, &args.source).await?;
+            download::download_file_with_shutdown(&args.output_file, &args.source, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
         }
     }
 

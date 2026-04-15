@@ -7,8 +7,14 @@ use crate::{
     torrent,
 };
 use rand::seq::SliceRandom;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
@@ -17,8 +23,46 @@ use tokio::{fs, time::timeout};
 const MAX_RETRIES: u32 = 5;
 const WORKER_COUNT: usize = 10;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+const PIECE_REQUEUE_LIMIT: u8 = 1;
+const COOLDOWN_ATTEMPTS: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PieceTask {
+    piece_index: usize,
+    retries_left: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerFailureKind {
+    Generic,
+    Timeout,
+    MissingPiece,
+    Verification,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeerHealth {
+    successes: usize,
+    failures: usize,
+    timeout_streak: usize,
+    cooldown_until: Option<Instant>,
+    unavailable_pieces: HashSet<usize>,
+    known_pieces: Option<Vec<bool>>,
+    last_error_kind: Option<PeerFailureKind>,
+}
 
 pub async fn download_file(output_file: &str, source: &str) -> Result<()> {
+    download_file_with_shutdown(output_file, source, std::future::pending()).await
+}
+
+pub async fn download_file_with_shutdown<F>(
+    output_file: &str,
+    source: &str,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = ()>,
+{
     let source::ResolvedDownloadSource {
         info,
         info_hash,
@@ -31,70 +75,138 @@ pub async fn download_file(output_file: &str, source: &str) -> Result<()> {
         completed_pieces: storage.completed_piece_count(),
         total_pieces: storage.total_piece_count(),
     });
-    let piece_availability = collect_piece_availability(&peers, &info, &info_hash, is_magnet).await;
+
+    let peer_health = Arc::new(Mutex::new(initialize_peer_health(&peers)));
+    let piece_availability =
+        collect_piece_availability(&peers, &info, &info_hash, is_magnet, &peer_health).await;
     let mut missing_pieces = storage.missing_piece_indices();
     sort_missing_pieces_by_availability(&mut missing_pieces, &piece_availability);
     if missing_pieces.is_empty() {
-        storage.finalize().await?;
+        let finalized_path = storage.finalize().await?;
         report::emit_stdout(&ProgressEvent::DownloadFinalized {
-            output: output_file,
+            output: finalized_path.to_string_lossy().as_ref(),
         });
         return Ok(());
     }
 
-    let piece_queue = Arc::new(Mutex::new(VecDeque::from(missing_pieces.clone())));
+    let piece_tasks = missing_pieces
+        .into_iter()
+        .map(|piece_index| PieceTask {
+            piece_index,
+            retries_left: PIECE_REQUEUE_LIMIT,
+        })
+        .collect::<Vec<_>>();
+    let piece_queue = Arc::new(Mutex::new(VecDeque::from(piece_tasks)));
     let storage = Arc::new(Mutex::new(storage));
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
     let mut join_set = JoinSet::new();
-    let worker_count = missing_pieces.len().min(WORKER_COUNT);
+    let worker_count = piece_queue.lock().await.len().min(WORKER_COUNT);
 
     for _ in 0..worker_count {
         let piece_queue = Arc::clone(&piece_queue);
         let storage = Arc::clone(&storage);
+        let peer_health = Arc::clone(&peer_health);
+        let shutdown_requested = Arc::clone(&shutdown_requested);
         let peers = peers.clone();
         let info = info.clone();
 
         join_set.spawn(async move {
             loop {
-                let piece_index = {
-                    let mut queue = piece_queue.lock().await;
-                    queue.pop_front()
-                };
+                let task = dequeue_piece_task(&piece_queue, &shutdown_requested).await;
 
-                let Some(piece_index) = piece_index else {
+                let Some(task) = task else {
                     break Ok::<(), TorrentError>(());
                 };
 
-                let piece_data = download_piece_with_retry_from_peers(
+                match download_piece_with_retry_from_peers(
                     &peers,
                     &info,
                     &info_hash,
-                    piece_index,
+                    task.piece_index,
                     is_magnet,
+                    &peer_health,
                 )
-                .await?;
-
-                let mut storage = storage.lock().await;
-                storage.write_piece(&info, piece_index, &piece_data).await?;
-                report::emit_stdout(&ProgressEvent::PieceStored {
-                    piece_index,
-                    completed_pieces: storage.completed_piece_count(),
-                    total_pieces: storage.total_piece_count(),
-                });
+                .await
+                {
+                    Ok(piece_data) => {
+                        let mut storage = storage.lock().await;
+                        storage
+                            .write_piece(&info, task.piece_index, &piece_data)
+                            .await?;
+                        report::emit_stdout(&ProgressEvent::PieceStored {
+                            piece_index: task.piece_index,
+                            completed_pieces: storage.completed_piece_count(),
+                            total_pieces: storage.total_piece_count(),
+                        });
+                    }
+                    Err(err) if task.retries_left > 0 => {
+                        if shutdown_requested.load(Ordering::Relaxed) {
+                            break Err(err);
+                        }
+                        report::emit_stderr(&ProgressEvent::PieceDownloadFailed {
+                            piece_index: task.piece_index,
+                            peer: "<requeue>",
+                            error: format!("requeued after failure: {err}"),
+                        });
+                        let mut queue = piece_queue.lock().await;
+                        queue.push_back(PieceTask {
+                            piece_index: task.piece_index,
+                            retries_left: task.retries_left - 1,
+                        });
+                    }
+                    Err(err) => break Err(err),
+                }
             }
         });
     }
 
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(err) => {
-                return Err(TorrentError::DownloadFailed(format!(
-                    "A download task failed: {}",
-                    err
-                )))
+    tokio::pin!(shutdown);
+    let mut interrupted = false;
+    let mut interruption_error: Option<TorrentError> = None;
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                interrupted = true;
+                shutdown_requested.store(true, Ordering::Relaxed);
+            }
+            result = join_set.join_next() => {
+                match result {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(err))) => {
+                        if interrupted {
+                            interruption_error = Some(err);
+                            continue;
+                        }
+                        return Err(err)
+                    }
+                    Some(Err(err)) => {
+                        if interrupted {
+                            interruption_error = Some(TorrentError::DownloadFailed(format!(
+                                "A download task failed: {}",
+                                err
+                            )));
+                            continue;
+                        }
+                        return Err(TorrentError::DownloadFailed(format!(
+                            "A download task failed: {}",
+                            err
+                        )));
+                    }
+                    None => break,
+                }
             }
         }
+    }
+
+    if interrupted {
+        while join_set.join_next().await.is_some() {}
+        report::emit_stderr(&ProgressEvent::DownloadInterrupted {
+            output: output_file,
+        });
+        return Err(interruption_error.unwrap_or_else(|| {
+            TorrentError::DownloadFailed("Interrupted; partial state preserved for resume".into())
+        }));
     }
 
     let storage = Arc::try_unwrap(storage)
@@ -107,9 +219,9 @@ pub async fn download_file(output_file: &str, source: &str) -> Result<()> {
         ));
     }
 
-    storage.finalize().await?;
+    let finalized_path = storage.finalize().await?;
     report::emit_stdout(&ProgressEvent::DownloadFinalized {
-        output: output_file,
+        output: finalized_path.to_string_lossy().as_ref(),
     });
     Ok(())
 }
@@ -122,9 +234,16 @@ pub async fn download_piece(output_file: &str, source: &str, piece_index: usize)
         is_magnet,
     } = source::resolve_download_source(source).await?;
 
-    let piece_data =
-        download_piece_with_retry_from_peers(&peers, &info, &info_hash, piece_index, is_magnet)
-            .await?;
+    let peer_health = Arc::new(Mutex::new(initialize_peer_health(&peers)));
+    let piece_data = download_piece_with_retry_from_peers(
+        &peers,
+        &info,
+        &info_hash,
+        piece_index,
+        is_magnet,
+        &peer_health,
+    )
+    .await?;
 
     fs::write(output_file, piece_data).await?;
     report::emit_stdout(&ProgressEvent::PieceWritten {
@@ -140,26 +259,28 @@ async fn download_piece_with_retry_from_peers(
     info_hash: &[u8; 20],
     piece_index: usize,
     is_magnet: bool,
+    peer_health: &Arc<Mutex<HashMap<String, PeerHealth>>>,
 ) -> Result<Vec<u8>> {
     if peers.is_empty() {
         return Err(TorrentError::NoPeersAvailable);
     }
 
-    let mut candidates = peers.to_vec();
-    {
-        let mut rng = rand::thread_rng();
-        candidates.shuffle(&mut rng);
-    }
+    let candidate_order = {
+        let health = peer_health.lock().await;
+        build_ranked_peer_list(peers, &health, piece_index, MAX_RETRIES as usize)
+    };
 
-    let max_attempts = (MAX_RETRIES as usize).max(candidates.len());
     let mut last_error =
         TorrentError::DownloadFailed(format!("Failed to download piece {}", piece_index));
+    let attempt_started_at = Instant::now();
 
-    for peer_addr in candidates.iter().cycle().take(max_attempts) {
+    for peer_addr in candidate_order {
         let peer_addr = peer_addr.to_string();
         match try_download_piece(&peer_addr, info, info_hash, piece_index, is_magnet).await {
             Ok(piece_data) => {
                 if torrent::verify_piece(info, piece_index, &piece_data) {
+                    let mut health = peer_health.lock().await;
+                    record_peer_success(&mut health, &peer_addr);
                     return Ok(piece_data);
                 }
                 last_error = TorrentError::PieceVerificationFailed;
@@ -167,15 +288,32 @@ async fn download_piece_with_retry_from_peers(
                     piece_index,
                     peer: &peer_addr,
                 });
+                let mut health = peer_health.lock().await;
+                record_peer_failure(
+                    &mut health,
+                    &peer_addr,
+                    piece_index,
+                    PeerFailureKind::Verification,
+                    attempt_started_at,
+                );
             }
             Err(err) => {
                 let error = err.to_string();
+                let failure_kind = classify_failure(&err);
                 last_error = err;
                 report::emit_stderr(&ProgressEvent::PieceDownloadFailed {
                     piece_index,
                     peer: &peer_addr,
                     error,
                 });
+                let mut health = peer_health.lock().await;
+                record_peer_failure(
+                    &mut health,
+                    &peer_addr,
+                    piece_index,
+                    failure_kind,
+                    attempt_started_at,
+                );
             }
         }
         sleep(RETRY_DELAY).await;
@@ -189,17 +327,19 @@ async fn collect_piece_availability(
     info: &torrent::TorrentInfo,
     info_hash: &[u8; 20],
     is_magnet: bool,
+    peer_health: &Arc<Mutex<HashMap<String, PeerHealth>>>,
 ) -> Vec<usize> {
     let mut availability = vec![0; info.pieces.len()];
 
     for peer_addr in peers {
         match fetch_peer_bitfield(&peer_addr.to_string(), info, info_hash, is_magnet).await {
             Ok(bitfield) => {
-                for (piece_index, has_piece) in bitfield.into_iter().enumerate() {
-                    if has_piece {
-                        availability[piece_index] += 1;
-                    }
-                }
+                apply_piece_availability_probe(&mut availability, &bitfield);
+                let mut health = peer_health.lock().await;
+                health
+                    .entry(peer_addr.to_string())
+                    .or_default()
+                    .known_pieces = Some(bitfield);
             }
             Err(err) => {
                 let peer = peer_addr.to_string();
@@ -277,10 +417,7 @@ async fn download_piece_from_peer(
     if !is_magnet {
         let _ = peer.receive_bitfield(info.pieces.len()).await?;
         if matches!(peer.has_piece(piece_index), Some(false)) {
-            return Err(TorrentError::DownloadFailed(format!(
-                "Peer does not advertise piece {}",
-                piece_index
-            )));
+            return Err(TorrentError::PeerDoesNotAdvertisePiece(piece_index));
         }
     }
     peer.send_interested().await?;
@@ -336,9 +473,144 @@ async fn download_piece_from_peer(
     Ok(piece_data)
 }
 
+fn initialize_peer_health(peers: &[std::net::SocketAddrV4]) -> HashMap<String, PeerHealth> {
+    peers
+        .iter()
+        .map(|peer| (peer.to_string(), PeerHealth::default()))
+        .collect()
+}
+
+async fn dequeue_piece_task(
+    piece_queue: &Arc<Mutex<VecDeque<PieceTask>>>,
+    shutdown_requested: &Arc<AtomicBool>,
+) -> Option<PieceTask> {
+    let mut queue = piece_queue.lock().await;
+    if shutdown_requested.load(Ordering::Relaxed) {
+        None
+    } else {
+        queue.pop_front()
+    }
+}
+
+fn build_ranked_peer_list(
+    peers: &[std::net::SocketAddrV4],
+    health: &HashMap<String, PeerHealth>,
+    piece_index: usize,
+    limit: usize,
+) -> Vec<std::net::SocketAddrV4> {
+    let mut peers = peers.to_vec();
+    {
+        let mut rng = rand::thread_rng();
+        peers.shuffle(&mut rng);
+    }
+
+    let now = Instant::now();
+    peers.sort_by_key(|peer| {
+        let key = health.get(&peer.to_string());
+        let in_cooldown = key
+            .and_then(|h| h.cooldown_until)
+            .is_some_and(|until| until > now);
+        let piece_state_rank = key
+            .and_then(|h| piece_known_rank(h, piece_index))
+            .unwrap_or(1u8);
+        let failures = key.map_or(0, |h| h.failures);
+        let timeouts = key.map_or(0, |h| h.timeout_streak);
+        let successes = key.map_or(0, |h| h.successes);
+        (
+            in_cooldown,
+            piece_state_rank,
+            failures,
+            timeouts,
+            Reverse(successes),
+        )
+    });
+
+    let take_count = limit.min(peers.len());
+    peers.into_iter().take(take_count).collect()
+}
+
+fn piece_known_rank(health: &PeerHealth, piece_index: usize) -> Option<u8> {
+    if health.unavailable_pieces.contains(&piece_index) {
+        return Some(2);
+    }
+
+    health.known_pieces.as_ref().map(|pieces| {
+        if pieces.get(piece_index).copied().unwrap_or(false) {
+            0
+        } else {
+            2
+        }
+    })
+}
+
+fn record_peer_success(health: &mut HashMap<String, PeerHealth>, peer: &str) {
+    let entry = health.entry(peer.to_string()).or_default();
+    entry.successes += 1;
+    entry.timeout_streak = 0;
+    entry.cooldown_until = None;
+    entry.last_error_kind = None;
+}
+
+fn record_peer_failure(
+    health: &mut HashMap<String, PeerHealth>,
+    peer: &str,
+    piece_index: usize,
+    failure_kind: PeerFailureKind,
+    attempt_started_at: Instant,
+) {
+    let entry = health.entry(peer.to_string()).or_default();
+    entry.failures += 1;
+    entry.last_error_kind = Some(failure_kind);
+
+    match failure_kind {
+        PeerFailureKind::Timeout => {
+            entry.timeout_streak += 1;
+            entry.cooldown_until = Some(attempt_started_at + RETRY_DELAY * COOLDOWN_ATTEMPTS);
+        }
+        PeerFailureKind::MissingPiece => {
+            entry.unavailable_pieces.insert(piece_index);
+            entry.cooldown_until = Some(attempt_started_at + RETRY_DELAY);
+        }
+        PeerFailureKind::Verification => {
+            entry.cooldown_until = Some(attempt_started_at + RETRY_DELAY * (COOLDOWN_ATTEMPTS + 1));
+        }
+        PeerFailureKind::Generic => {
+            entry.timeout_streak = 0;
+            entry.cooldown_until = Some(attempt_started_at + RETRY_DELAY);
+        }
+    }
+}
+
+fn classify_failure(err: &TorrentError) -> PeerFailureKind {
+    match err {
+        TorrentError::ConnectionTimeout => PeerFailureKind::Timeout,
+        TorrentError::PieceVerificationFailed => PeerFailureKind::Verification,
+        TorrentError::PeerDoesNotAdvertisePiece(_) => PeerFailureKind::MissingPiece,
+        _ => PeerFailureKind::Generic,
+    }
+}
+
+fn apply_piece_availability_probe(availability: &mut [usize], bitfield: &[bool]) {
+    for (piece_index, has_piece) in bitfield.iter().enumerate() {
+        if *has_piece && piece_index < availability.len() {
+            availability[piece_index] += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sort_missing_pieces_by_availability;
+    use super::{
+        apply_piece_availability_probe, build_ranked_peer_list, classify_failure,
+        dequeue_piece_task, initialize_peer_health, record_peer_failure,
+        sort_missing_pieces_by_availability, PeerFailureKind, PieceTask,
+    };
+    use crate::error::TorrentError;
+    use std::collections::VecDeque;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::{atomic::AtomicBool, Arc};
+    use std::time::Instant;
+    use tokio::sync::Mutex;
 
     #[test]
     fn prefers_rarest_nonzero_pieces_first_and_unknown_last() {
@@ -348,5 +620,86 @@ mod tests {
         sort_missing_pieces_by_availability(&mut missing, &availability);
 
         assert_eq!(missing, vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn shorter_availability_vectors_sort_unknown_pieces_last() {
+        let mut missing = vec![0, 1, 2, 3];
+        let availability = vec![3, 1];
+
+        sort_missing_pieces_by_availability(&mut missing, &availability);
+
+        assert_eq!(missing, vec![1, 0, 2, 3]);
+    }
+
+    #[test]
+    fn availability_probe_counts_only_advertised_pieces() {
+        let mut availability = vec![0; 4];
+        apply_piece_availability_probe(&mut availability, &[true, false, true, false]);
+        apply_piece_availability_probe(&mut availability, &[false, true, true, false]);
+
+        assert_eq!(availability, vec![1, 1, 2, 0]);
+    }
+
+    #[test]
+    fn cooldown_and_missing_piece_demote_peer() {
+        let peers = vec![
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6881),
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6882),
+        ];
+        let mut health = initialize_peer_health(&peers);
+        record_peer_failure(
+            &mut health,
+            &peers[0].to_string(),
+            3,
+            PeerFailureKind::MissingPiece,
+            Instant::now(),
+        );
+
+        let ranked = build_ranked_peer_list(&peers, &health, 3, peers.len());
+        assert_eq!(ranked[0], peers[1]);
+    }
+
+    #[test]
+    fn no_peers_error_is_classified_as_generic() {
+        assert_eq!(
+            classify_failure(&TorrentError::NoPeersAvailable),
+            PeerFailureKind::Generic
+        );
+    }
+
+    #[test]
+    fn timeout_failures_increase_cooldown() {
+        let peers = vec![SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6881)];
+        let mut health = initialize_peer_health(&peers);
+        let peer = peers[0].to_string();
+        let started_at = Instant::now();
+        record_peer_failure(&mut health, &peer, 0, PeerFailureKind::Timeout, started_at);
+
+        let peer_health = health.get(&peer).expect("peer health should exist");
+        assert_eq!(peer_health.timeout_streak, 1);
+        assert!(peer_health.cooldown_until.is_some());
+        assert!(peer_health.cooldown_until.expect("cooldown should exist") > started_at);
+    }
+
+    #[test]
+    fn structured_missing_piece_errors_are_classified_correctly() {
+        assert_eq!(
+            classify_failure(&TorrentError::PeerDoesNotAdvertisePiece(7)),
+            PeerFailureKind::MissingPiece
+        );
+    }
+
+    #[tokio::test]
+    async fn dequeue_respects_shutdown_before_starting_new_work() {
+        let queue = Arc::new(Mutex::new(VecDeque::<PieceTask>::from([PieceTask {
+            piece_index: 3,
+            retries_left: 1,
+        }])));
+        let shutdown_requested = Arc::new(AtomicBool::new(true));
+
+        let task = dequeue_piece_task(&queue, &shutdown_requested).await;
+        assert!(task.is_none());
+        assert_eq!(queue.lock().await.len(), 1);
     }
 }

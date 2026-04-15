@@ -7,7 +7,7 @@
 # DON'T EDIT THIS!
 [package]
 name = "bittorrent-starter-rust"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["Codecrafters <hello@codecrafters.io>"]
 edition = "2021"
 

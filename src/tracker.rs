@@ -73,17 +73,31 @@ impl TrackerResponse {
         let client = Client::new();
         let mut last_error = None;
         let mut last_empty_response = None;
+        let mut errors = Vec::new();
 
         for tracker in &t.trackers {
             match query_tracker(&client, tracker, info_hash, &request).await {
                 Ok(response) if !response.peers.0.is_empty() => return Ok(response),
                 Ok(response) => last_empty_response = Some(response),
-                Err(err) => last_error = Some(err),
+                Err(err) => {
+                    errors.push(format!("{tracker}: {err}"));
+                    last_error = Some(err);
+                }
             }
         }
 
         if let Some(response) = last_empty_response {
+            if errors.is_empty() {
+                return Ok(response);
+            }
             return Ok(response);
+        }
+
+        if !errors.is_empty() {
+            return Err(TorrentError::Tracker(format!(
+                "All trackers failed: {}",
+                errors.join(" | ")
+            )));
         }
 
         Err(last_error.unwrap_or(TorrentError::NoPeersAvailable))
@@ -506,8 +520,9 @@ mod tests {
     use super::{
         build_tracker_url, encode_udp_announce_request, encode_udp_connect_request,
         parse_tracker_response, parse_udp_announce_response, parse_udp_connect_response,
-        percent_encode, udp_connection_id_is_fresh, TrackerRequest,
+        percent_encode, udp_connection_id_is_fresh, TrackerRequest, TrackerResponse,
     };
+    use crate::torrent::{TorrentInfo, TorrentLayout};
     use std::time::Duration;
 
     #[test]
@@ -550,6 +565,33 @@ mod tests {
         let err = parse_tracker_response(&encoded).expect_err("failure reason should be surfaced");
 
         assert!(err.to_string().contains("bad tracker"));
+    }
+
+    #[tokio::test]
+    async fn aggregates_tracker_errors_when_all_trackers_fail() {
+        let info = TorrentInfo {
+            trackers: vec![
+                "http://127.0.0.1:1/announce".into(),
+                "udp://127.0.0.1:1/announce".into(),
+            ],
+            info_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+            length: 1,
+            name: "file.bin".into(),
+            piece_length: 1,
+            pieces: vec![[0u8; 20]],
+            layout: Some(TorrentLayout::SingleFile {
+                suggested_name: "file.bin".into(),
+                length: 1,
+            }),
+        };
+
+        let err = TrackerResponse::query(&info, &[0u8; 20])
+            .await
+            .expect_err("all trackers should fail");
+        let message = err.to_string();
+        assert!(message.contains("All trackers failed"));
+        assert!(message.contains("http://127.0.0.1:1/announce"));
+        assert!(message.contains("udp://127.0.0.1:1/announce"));
     }
 
     #[test]
