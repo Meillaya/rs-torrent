@@ -32,6 +32,7 @@ struct ResumeState {
     info_hash: String,
     piece_length: i64,
     total_length: i64,
+    completed_piece_count: usize,
     completed_pieces: Vec<bool>,
 }
 
@@ -92,11 +93,7 @@ impl DownloadStorage {
     }
 
     pub fn completed_piece_count(&self) -> usize {
-        self.state
-            .completed_pieces
-            .iter()
-            .filter(|completed| **completed)
-            .count()
+        self.state.completed_piece_count
     }
 
     pub fn total_piece_count(&self) -> usize {
@@ -113,6 +110,15 @@ impl DownloadStorage {
             return Err(TorrentError::PieceVerificationFailed);
         }
 
+        self.write_verified_piece(info, piece_index, data).await
+    }
+
+    pub(crate) async fn write_verified_piece(
+        &mut self,
+        info: &TorrentInfo,
+        piece_index: usize,
+        data: &[u8],
+    ) -> Result<()> {
         let expected_len = piece_length_for(info, piece_index)?;
         if data.len() != expected_len {
             return Err(TorrentError::UnexpectedBlockData);
@@ -123,7 +129,10 @@ impl DownloadStorage {
         self.file.flush().await?;
         self.file.sync_data().await?;
 
-        self.state.completed_pieces[piece_index] = true;
+        if !self.state.completed_pieces[piece_index] {
+            self.state.completed_pieces[piece_index] = true;
+            self.state.completed_piece_count += 1;
+        }
         self.persist_state().await?;
         Ok(())
     }
@@ -195,12 +204,14 @@ impl DownloadStorage {
         let persisted: ResumeState = serde_json::from_slice(&raw_state)?;
         if persisted.matches(info) {
             self.state = persisted;
+            self.state.refresh_completed_piece_count();
         } else {
             self.state = ResumeState::new(info);
             self.file.set_len(info.length as u64).await?;
             self.file.seek(std::io::SeekFrom::Start(0)).await?;
         }
 
+        self.state.refresh_completed_piece_count();
         Ok(())
     }
 
@@ -269,6 +280,7 @@ impl ResumeState {
             info_hash: info.info_hash.clone(),
             piece_length: info.piece_length,
             total_length: info.length,
+            completed_piece_count: 0,
             completed_pieces: vec![false; info.pieces.len()],
         }
     }
@@ -278,6 +290,14 @@ impl ResumeState {
             && self.piece_length == info.piece_length
             && self.total_length == info.length
             && self.completed_pieces.len() == info.pieces.len()
+    }
+
+    fn refresh_completed_piece_count(&mut self) {
+        self.completed_piece_count = self
+            .completed_pieces
+            .iter()
+            .filter(|completed| **completed)
+            .count();
     }
 }
 
@@ -444,7 +464,10 @@ async fn materialize_multi_file_tree(
 #[cfg(test)]
 mod tests {
     use super::DownloadStorage;
-    use crate::torrent::{TorrentInfo, TorrentLayout, TorrentLayoutFile};
+    use crate::{
+        error::TorrentError,
+        torrent::{TorrentInfo, TorrentLayout, TorrentLayoutFile},
+    };
     use sha1::{Digest, Sha1};
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -582,6 +605,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_write_path_is_resumable() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output = dir.path().join("download.bin");
+        let info = fake_info();
+
+        let mut storage = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should open");
+        storage
+            .write_verified_piece(&info, 0, b"abcd")
+            .await
+            .expect("verified piece should write");
+        drop(storage);
+
+        let resumed = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should reopen");
+        assert_eq!(resumed.missing_piece_indices(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn safe_write_path_rejects_bad_hashes() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output = dir.path().join("download.bin");
+        let info = fake_info();
+
+        let mut storage = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should open");
+        let err = storage
+            .write_piece(&info, 0, b"zzzz")
+            .await
+            .expect_err("bad piece hash should be rejected");
+
+        assert!(matches!(err, TorrentError::PieceVerificationFailed));
+        assert_eq!(storage.missing_piece_indices(), vec![0, 1]);
+    }
+
+    #[tokio::test]
     async fn finalizes_multi_file_layout_under_destination_root() {
         let dir = tempdir().expect("tempdir should exist");
         let output_root = dir.path().join("downloads");
@@ -670,5 +732,33 @@ mod tests {
             .expect_err("unsafe path should fail");
         assert!(err.to_string().contains("unsafe"));
         assert!(!output_root.join("evil.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn verified_write_path_preserves_single_file_finalize_behavior() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output = dir.path().join("download.bin");
+        let info = fake_info();
+
+        let mut storage = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should open");
+        storage
+            .write_verified_piece(&info, 0, b"abcd")
+            .await
+            .expect("first verified piece should write");
+        storage
+            .write_verified_piece(&info, 1, b"efgh")
+            .await
+            .expect("second verified piece should write");
+        let finalized = storage.finalize().await.expect("finalize should succeed");
+
+        assert_eq!(finalized, output);
+        let final_bytes = tokio::fs::read(&finalized)
+            .await
+            .expect("final output should exist");
+        assert_eq!(&final_bytes, b"abcdefgh");
+        assert!(!output.with_extension("bin.part").exists());
+        assert!(!output.with_extension("bin.resume.json").exists());
     }
 }

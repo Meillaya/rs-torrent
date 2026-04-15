@@ -40,6 +40,13 @@ pub struct TrackerResponse {
     pub peers: Peers,
 }
 
+#[derive(Debug, Clone)]
+pub struct TrackerQueryOutcome {
+    pub tracker: String,
+    pub response: TrackerResponse,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawTrackerResponse {
     #[serde(default)]
@@ -57,6 +64,13 @@ struct UdpConnectionId {
 
 impl TrackerResponse {
     pub async fn query(t: &TorrentInfo, info_hash: &[u8; 20]) -> Result<Self> {
+        Ok(Self::query_with_outcome(t, info_hash).await?.response)
+    }
+
+    pub async fn query_with_outcome(
+        t: &TorrentInfo,
+        info_hash: &[u8; 20],
+    ) -> Result<TrackerQueryOutcome> {
         if t.trackers.is_empty() {
             return Err(TorrentError::Tracker("No trackers available".into()));
         }
@@ -77,8 +91,14 @@ impl TrackerResponse {
 
         for tracker in &t.trackers {
             match query_tracker(&client, tracker, info_hash, &request).await {
-                Ok(response) if !response.peers.0.is_empty() => return Ok(response),
-                Ok(response) => last_empty_response = Some(response),
+                Ok(response) if !response.peers.0.is_empty() => {
+                    return Ok(TrackerQueryOutcome {
+                        tracker: tracker.clone(),
+                        response,
+                        warnings: errors,
+                    })
+                }
+                Ok(response) => last_empty_response = Some((tracker.clone(), response)),
                 Err(err) => {
                     errors.push(format!("{tracker}: {err}"));
                     last_error = Some(err);
@@ -86,11 +106,12 @@ impl TrackerResponse {
             }
         }
 
-        if let Some(response) = last_empty_response {
-            if errors.is_empty() {
-                return Ok(response);
-            }
-            return Ok(response);
+        if let Some((tracker, response)) = last_empty_response {
+            return Ok(TrackerQueryOutcome {
+                tracker,
+                response,
+                warnings: errors,
+            });
         }
 
         if !errors.is_empty() {

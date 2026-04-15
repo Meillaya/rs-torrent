@@ -13,6 +13,8 @@ pub struct ResolvedDownloadSource {
     pub info_hash: [u8; 20],
     pub peers: Vec<SocketAddrV4>,
     pub is_magnet: bool,
+    pub selected_tracker: Option<String>,
+    pub tracker_warnings: Vec<String>,
 }
 
 pub fn is_magnet_link(source: &str) -> bool {
@@ -28,46 +30,72 @@ pub async fn resolve_download_source(source: &str) -> Result<ResolvedDownloadSou
     if is_magnet_link(source) {
         let parsed_magnet = Magnet::parse(source)?;
         let info_hash = parse_info_hash(&parsed_magnet.info_hash)?;
-        let (info, peers) = retrieve_torrent_info_from_magnet(&parsed_magnet, &info_hash).await?;
+        let (info, peers, selected_tracker, tracker_warnings) =
+            retrieve_torrent_info_from_magnet(&parsed_magnet, &info_hash).await?;
 
         return Ok(ResolvedDownloadSource {
             info,
             info_hash,
             peers,
             is_magnet: true,
+            selected_tracker,
+            tracker_warnings,
         });
     }
 
     let info = torrent::get_info(source)?;
     let info_hash = parse_info_hash(&info.info_hash)?;
-    let tracker_response = tracker::TrackerResponse::query(&info, &info_hash).await?;
+    let tracker_outcome = tracker::TrackerResponse::query_with_outcome(&info, &info_hash).await?;
 
-    if tracker_response.peers.0.is_empty() {
+    if tracker_outcome.response.peers.0.is_empty() {
+        if !tracker_outcome.warnings.is_empty() {
+            return Err(TorrentError::Tracker(format!(
+                "Tracker {} returned no peers after fallback errors: {}",
+                tracker_outcome.tracker,
+                tracker_outcome.warnings.join(" | ")
+            )));
+        }
         return Err(TorrentError::NoPeersAvailable);
     }
 
     Ok(ResolvedDownloadSource {
         info,
         info_hash,
-        peers: tracker_response.peers.0,
+        peers: tracker_outcome.response.peers.0,
         is_magnet: false,
+        selected_tracker: Some(tracker_outcome.tracker),
+        tracker_warnings: tracker_outcome.warnings,
     })
 }
 
 async fn retrieve_torrent_info_from_magnet(
     parsed_magnet: &magnet::Magnet,
     info_hash: &[u8; 20],
-) -> Result<(TorrentInfo, Vec<SocketAddrV4>)> {
+) -> Result<(TorrentInfo, Vec<SocketAddrV4>, Option<String>, Vec<String>)> {
     let torrent_info = TorrentInfo::from_magnet(parsed_magnet)?;
-    let tracker_response = TrackerResponse::query(&torrent_info, info_hash).await?;
+    let tracker_outcome = TrackerResponse::query_with_outcome(&torrent_info, info_hash).await?;
 
-    if tracker_response.peers.0.is_empty() {
+    if tracker_outcome.response.peers.0.is_empty() {
+        if !tracker_outcome.warnings.is_empty() {
+            return Err(TorrentError::Tracker(format!(
+                "Tracker {} returned no peers after fallback errors: {}",
+                tracker_outcome.tracker,
+                tracker_outcome.warnings.join(" | ")
+            )));
+        }
         return Err(TorrentError::NoPeersAvailable);
     }
 
-    for peer_addr in &tracker_response.peers.0 {
+    for peer_addr in &tracker_outcome.response.peers.0 {
         match get_metadata_from_peer(&peer_addr.to_string(), info_hash).await {
-            Ok(validated_info) => return Ok((validated_info, tracker_response.peers.0.clone())),
+            Ok(validated_info) => {
+                return Ok((
+                    validated_info,
+                    tracker_outcome.response.peers.0.clone(),
+                    Some(tracker_outcome.tracker.clone()),
+                    tracker_outcome.warnings.clone(),
+                ))
+            }
             Err(e) => {
                 eprintln!("Failed to get metadata from peer {}: {}", peer_addr, e);
             }

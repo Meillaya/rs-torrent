@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v0.3.0
+
+### Added
+- Cooperative interruption handling with durable piece-level resume checkpoints
+- Adaptive scheduler updates driven by peer health, live bitfield knowledge, missing-piece knowledge, and requeue reordering
+- Selected-tracker reporting and stronger fallback diagnostics across CLI paths
+- Release-readiness automation via `scripts/release-readiness.sh`
+- Release confidence documentation via `docs/live-acceptance-corpus.md` and `docs/release-checklist.md`
+
+### Changed
+- Peer ranking now uses deterministic tie-breaking plus richer signal weighting
+- Shared piece-availability state is updated during a run instead of being treated as startup-only knowledge
+- Verified piece writes now use a trusted fast path while preserving the safe public wrapper
+- GitHub release workflow now verifies the repository before publishing tags
+
+### Fixed
+- Tracker fallback warnings now survive successful and empty-peer fallback cases
+- The scheduler no longer double-counts startup bitfield availability
+- True ranking ties are now deterministic
+
 ## v0.2.1
 
 ### Fixed

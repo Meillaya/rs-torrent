@@ -5,7 +5,7 @@ use bittorrent_starter_rust::{
     error::{Result, TorrentError},
     magnet, peer, peer_id, source,
     torrent::{self, TorrentInfo},
-    tracker::TrackerResponse,
+    tracker::{TrackerQueryOutcome, TrackerResponse},
 };
 use serde_bencode::value::Value as BencodeValue;
 use serde_json::Value;
@@ -28,8 +28,13 @@ async fn main() -> Result<()> {
         Command::Peers { torrent_file } => {
             let info = torrent::get_info(&torrent_file)?;
             let info_hash = source::parse_info_hash(&info.info_hash)?;
-            let tracker_response = TrackerResponse::query(&info, &info_hash).await?;
-            for peer in tracker_response.peers.0 {
+            let tracker_outcome = TrackerResponse::query_with_outcome(&info, &info_hash).await?;
+            emit_tracker_warnings(&tracker_outcome.warnings);
+            if tracker_outcome.response.peers.0.is_empty() {
+                return tracker_no_peers_error(&tracker_outcome);
+            }
+            println!("Tracker URL: {}", tracker_outcome.tracker);
+            for peer in tracker_outcome.response.peers.0 {
                 println!("{}", peer);
             }
         }
@@ -96,13 +101,14 @@ async fn magnet_info(magnet_link: &str) -> Result<()> {
     let peer_id: [u8; 20] = peer_id::generate_peer_id();
 
     let torrent_info = TorrentInfo::from_magnet(&parsed_magnet)?;
-    let tracker_response = TrackerResponse::query(&torrent_info, &info_hash).await?;
+    let tracker_outcome = TrackerResponse::query_with_outcome(&torrent_info, &info_hash).await?;
+    emit_tracker_warnings(&tracker_outcome.warnings);
 
-    if tracker_response.peers.0.is_empty() {
-        return Err(TorrentError::NoPeersAvailable);
+    if tracker_outcome.response.peers.0.is_empty() {
+        return tracker_no_peers_error(&tracker_outcome);
     }
 
-    let peer_addr = &tracker_response.peers.0[0].to_string();
+    let peer_addr = &tracker_outcome.response.peers.0[0].to_string();
     let mut peer = peer::Peer::new(peer_addr).await?;
 
     peer.handshake(&info_hash, &peer_id).await?;
@@ -111,10 +117,7 @@ async fn magnet_info(magnet_link: &str) -> Result<()> {
     // Validate and display the received metadata
     let validated_info = TorrentInfo::validate_metadata(&metadata, &parsed_magnet.info_hash)?;
 
-    println!(
-        "Tracker URL: {}",
-        parsed_magnet.trackers.first().cloned().unwrap_or_default()
-    );
+    println!("Tracker URL: {}", tracker_outcome.tracker);
     println!("Length: {}", validated_info.length);
     println!("Info Hash: {}", validated_info.info_hash);
     println!("Piece Length: {}", validated_info.piece_length);
@@ -131,13 +134,15 @@ async fn magnet_handshake(magnet_link: &str) -> Result<()> {
     let info_hash = source::parse_info_hash(&parsed_magnet.info_hash)?;
 
     let torrent_info = TorrentInfo::from_magnet(&parsed_magnet)?;
-    let tracker_response = TrackerResponse::query(&torrent_info, &info_hash).await?;
+    let tracker_outcome = TrackerResponse::query_with_outcome(&torrent_info, &info_hash).await?;
+    emit_tracker_warnings(&tracker_outcome.warnings);
 
-    if tracker_response.peers.0.is_empty() {
-        return Err(TorrentError::NoPeersAvailable);
+    if tracker_outcome.response.peers.0.is_empty() {
+        return tracker_no_peers_error(&tracker_outcome);
     }
 
-    let peer_addr = &tracker_response.peers.0[0].to_string();
+    println!("Tracker URL: {}", tracker_outcome.tracker);
+    let peer_addr = &tracker_outcome.response.peers.0[0].to_string();
     let mut peer = peer::Peer::new(peer_addr).await?;
     let peer_id = peer_id::generate_peer_id();
     let received_peer_id = peer.handshake(&info_hash, &peer_id).await?;
@@ -163,5 +168,23 @@ fn bencode_to_json(value: BencodeValue) -> Value {
             }
             Value::Object(map)
         }
+    }
+}
+
+fn emit_tracker_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("[warn] tracker fallback detail: {warning}");
+    }
+}
+
+fn tracker_no_peers_error(outcome: &TrackerQueryOutcome) -> Result<()> {
+    if outcome.warnings.is_empty() {
+        Err(TorrentError::NoPeersAvailable)
+    } else {
+        Err(TorrentError::Tracker(format!(
+            "Tracker {} returned no peers after fallback errors: {}",
+            outcome.tracker,
+            outcome.warnings.join(" | ")
+        )))
     }
 }

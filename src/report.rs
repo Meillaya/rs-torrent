@@ -8,6 +8,12 @@ pub enum ProgressEvent<'a> {
         peer: &'a str,
         error: String,
     },
+    TrackerSelected {
+        tracker: &'a str,
+    },
+    TrackerWarning {
+        message: &'a str,
+    },
     PieceStored {
         piece_index: usize,
         completed_pieces: usize,
@@ -44,6 +50,12 @@ pub fn render_event(event: &ProgressEvent<'_>) -> String {
         ),
         ProgressEvent::BitfieldProbeFailed { peer, error } => {
             format!("[warn] failed to probe peer bitfield from {peer}: {error}")
+        }
+        ProgressEvent::TrackerSelected { tracker } => {
+            format!("[progress] selected tracker: {tracker}")
+        }
+        ProgressEvent::TrackerWarning { message } => {
+            format!("[warn] tracker fallback detail: {message}")
         }
         ProgressEvent::PieceStored {
             piece_index,
@@ -108,6 +120,30 @@ mod tests {
         assert_eq!(
             rendered,
             "[warn] failed to download piece 3 from 127.0.0.1:6881: timeout"
+        );
+    }
+
+    #[test]
+    fn renders_tracker_selection() {
+        let rendered = render_event(&ProgressEvent::TrackerSelected {
+            tracker: "udp://tracker.test:6969/announce",
+        });
+
+        assert_eq!(
+            rendered,
+            "[progress] selected tracker: udp://tracker.test:6969/announce"
+        );
+    }
+
+    #[test]
+    fn renders_tracker_warning() {
+        let rendered = render_event(&ProgressEvent::TrackerWarning {
+            message: "udp://a failed | http://b timed out",
+        });
+
+        assert_eq!(
+            rendered,
+            "[warn] tracker fallback detail: udp://a failed | http://b timed out"
         );
     }
 

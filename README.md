@@ -145,6 +145,26 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+Run the local release-readiness script:
+
+```bash
+./scripts/release-readiness.sh
+```
+
+Require live acceptance coverage as part of the release-readiness run:
+
+```bash
+./scripts/release-readiness.sh --with-live
+```
+
+Explain which live env vars are still missing:
+
+```bash
+./scripts/release-readiness.sh --explain-live
+```
+
+If only some live env vars are configured, the script will report that the setup is partial and list both the configured and missing variables.
+
 ## Live acceptance tests
 
 Live swarm tests are available, but they are ignored by default.
@@ -164,6 +184,10 @@ Run the ignored live suite:
 ```bash
 cargo test --test live_acceptance -- --ignored
 ```
+
+The GitHub release workflow now runs deterministic release-readiness checks before publishing a tag. If all `RS_TORRENT_LIVE_*` secrets are configured in the repository, it can also run the ignored live acceptance suite automatically.
+
+Detailed corpus guidance lives in `docs/live-acceptance-corpus.md`. A short release process reference lives in `docs/release-checklist.md`.
 
 ## Current limitations
 

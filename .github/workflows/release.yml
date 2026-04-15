@@ -15,7 +15,37 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      RS_TORRENT_LIVE_TORRENT: ${{ secrets.RS_TORRENT_LIVE_TORRENT }}
+      RS_TORRENT_LIVE_MAGNET: ${{ secrets.RS_TORRENT_LIVE_MAGNET }}
+      RS_TORRENT_LIVE_RESUME_SOURCE: ${{ secrets.RS_TORRENT_LIVE_RESUME_SOURCE }}
+      RS_TORRENT_LIVE_MULTI_FILE_TORRENT: ${{ secrets.RS_TORRENT_LIVE_MULTI_FILE_TORRENT }}
+      RS_TORRENT_LIVE_UDP_TORRENT: ${{ secrets.RS_TORRENT_LIVE_UDP_TORRENT }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Run deterministic release-readiness checks
+        run: ./scripts/release-readiness.sh
+
+      - name: Summarize live acceptance configuration
+        run: |
+          {
+            echo "## Live acceptance configuration"
+            ./scripts/release-readiness.sh --explain-live
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run live acceptance checks when secrets are configured
+        if: ${{ secrets.RS_TORRENT_LIVE_TORRENT != '' && secrets.RS_TORRENT_LIVE_MAGNET != '' && secrets.RS_TORRENT_LIVE_RESUME_SOURCE != '' && secrets.RS_TORRENT_LIVE_MULTI_FILE_TORRENT != '' && secrets.RS_TORRENT_LIVE_UDP_TORRENT != '' }}
+        run: ./scripts/release-readiness.sh --with-live
+
   release:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
