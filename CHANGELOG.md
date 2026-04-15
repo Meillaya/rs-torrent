@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.3.1
+
+### Fixed
+- Aligned the release line with the current branch after the release-workflow secret-gating fix
+- Kept the GitHub release workflow manually dispatchable for existing tags after the 0.3.0 release
+
 ## v0.3.0
 
 ### Added
