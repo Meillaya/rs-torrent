@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## v0.4.0
+
+### Added
+- Release-readiness automation via `scripts/release-readiness.sh`
+- Live acceptance corpus and release checklist docs
+- Cooperative interruption handling with durable piece-level resume checkpoints
+- Selected-tracker reporting and stronger tracker fallback diagnostics across CLI paths
+- Adaptive scheduler updates driven by peer health, live bitfield knowledge, missing-piece knowledge, shared availability counts, and requeue reordering
+
+### Changed
+- GitHub release workflow now verifies the repository before publishing tags
+- `download_piece` now surfaces tracker selection/fallback warnings consistently with full downloads
+- Peer ranking now uses deterministic tie-breaking and richer weighting from known-good pieces and recent error severity
+- Verified piece writes now use a trusted fast path while preserving the safe public wrapper
+
+### Fixed
+- Tracker fallback warnings now survive successful and empty-peer fallback paths across CLI commands
+- The scheduler no longer double-counts startup bitfield availability
+- Shutdown now stops dequeuing new work at the queue boundary instead of aborting workers
+- True ranking ties are deterministic and tested
+
 ## v0.3.1
 
 ### Fixed

@@ -126,7 +126,6 @@ impl DownloadStorage {
 
         self.seek_to_piece(info, piece_index).await?;
         self.file.write_all(data).await?;
-        self.file.flush().await?;
         self.file.sync_data().await?;
 
         if !self.state.completed_pieces[piece_index] {
@@ -243,7 +242,6 @@ impl DownloadStorage {
         let length = piece_length_for(info, piece_index)?;
         self.seek_to_piece(info, piece_index).await?;
         self.file.write_all(&vec![0u8; length]).await?;
-        self.file.flush().await?;
         self.file.sync_data().await?;
         Ok(())
     }
@@ -266,7 +264,6 @@ impl DownloadStorage {
             .open(&tmp_path)
             .await?;
         temp.write_all(&encoded).await?;
-        temp.flush().await?;
         temp.sync_data().await?;
         drop(temp);
         fs::rename(&tmp_path, &self.state_path).await?;
