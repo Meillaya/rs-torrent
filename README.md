@@ -1,87 +1,109 @@
-# BitTorrent Client
+# rs-torrent
 
-A Rust BitTorrent CLI downloader with:
-- `.torrent` support
-- magnet support
-- tracker + peer protocol handling
-- persisted partial downloads via `.part` + `.resume.json`
-- resume validation on restart
-- deterministic unit/integration coverage plus opt-in live acceptance tests
+`rs-torrent` is a Rust BitTorrent CLI downloader.
 
-## Current focus
+It currently focuses on dependable foreground downloads from `.torrent` files and magnet links. The codebase includes resume support, piece verification, tracker and peer protocol handling, and a growing automated test suite.
 
-This project is currently optimized as a **personal CLI downloader** with a reusable internal core.
+## Scope
 
-Intentionally out of scope for now:
-- daemon/server mode
-- GUI/web UI
-- DHT / PEX / LSD
-- NAT traversal / UPnP
-- protocol encryption
-- stable public library API
+This project is aimed at a personal CLI downloader with a reusable internal core.
 
-## Build and verify
+It is not currently targeting daemon mode, GUI/web interfaces, DHT/PEX/LSD, NAT traversal, protocol encryption, or a stable public library API.
+
+## Install
+
+Build a release binary:
 
 ```bash
-cargo fmt --all --check
-cargo check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
 ```
 
-## CLI usage
+The binary will be available at:
 
-### Show help
+```bash
+./target/release/bittorrent-starter-rust
+```
+
+Install it into your Cargo bin directory:
+
+```bash
+cargo install --path .
+```
+
+## Build
+
+Check and build the project locally:
+
+```bash
+cargo check
+cargo build
+cargo build --release
+```
+
+## Run
+
+Show the available commands:
 
 ```bash
 cargo run -- --help
 ```
 
-### Decode a bencoded value
+Decode a bencoded value:
 
 ```bash
 cargo run -- decode '5:hello'
 ```
 
-### Inspect a torrent file
+Inspect a torrent file:
 
 ```bash
 cargo run -- info sample.torrent
 ```
 
-### List peers for a torrent
+List tracker peers for a torrent:
 
 ```bash
 cargo run -- peers sample.torrent
 ```
 
-### Download a full file from a torrent
+Download a full file from a torrent:
 
 ```bash
 cargo run -- download -o output.bin sample.torrent
 ```
 
-### Download a single piece
+Download a single piece:
 
 ```bash
 cargo run -- download_piece -o piece.bin sample.torrent 0
 ```
 
-### Parse a magnet link
+Parse a magnet link:
 
 ```bash
 cargo run -- magnet_parse 'magnet:?xt=urn:btih:<info-hash>&tr=http://tracker.example/announce'
 ```
 
-### Download from a magnet link
+Download from a magnet link:
 
 ```bash
 cargo run -- magnet_download -o output.bin 'magnet:?xt=urn:btih:<info-hash>&tr=http://tracker.example/announce'
 ```
 
+## Resume behavior
+
+Full-file downloads write to a temporary part file and a JSON resume sidecar.
+
+```text
+<output>.part
+<output>.resume.json
+```
+
+On restart, the downloader reloads the saved state, re-validates completed pieces, discards corrupted partial data, and resumes only the missing pieces.
+
 ## Progress output
 
-The downloader now emits structured human-readable progress lines such as:
+The CLI emits short progress and warning lines while downloading.
 
 ```text
 [progress] resume state loaded: 2/10 pieces already complete
@@ -90,47 +112,36 @@ The downloader now emits structured human-readable progress lines such as:
 [warn] failed to probe peer bitfield from 127.0.0.1:6881: timeout
 ```
 
-These are intended to make foreground CLI use easier to understand while the downloader is running.
+## Test
 
-## Resume behavior
-
-For full-file downloads the downloader writes:
-- `<output>.part`
-- `<output>.resume.json`
-
-On restart it:
-1. reloads the saved state
-2. re-validates completed pieces against piece hashes
-3. marks corrupted resumed pieces incomplete
-4. resumes only the missing pieces
-5. renames the `.part` file to the final output once complete
-
-## Test suite
-
-### Deterministic tests
-
-The default `cargo test` suite includes:
-- unit tests for parsing / protocol helpers / storage / scheduling
-- integration tests for CLI entrypoints
-
-### Opt-in live acceptance tests
-
-Live tests are intentionally **ignored by default** because they require real swarms and network access.
-
-Available live smoke tests:
-- torrent download
-- magnet download
-- interrupted download + resume
-
-Environment variables:
+Run the deterministic local suite:
 
 ```bash
-export RS_TORRENT_LIVE_TORRENT='<torrent-file-or-url-you-use-for-live-smoke>'
-export RS_TORRENT_LIVE_MAGNET='magnet:?xt=urn:btih:...'
-export RS_TORRENT_LIVE_RESUME_SOURCE='<same kind of source used for resume smoke>'
+cargo test
 ```
 
-Run them with:
+Run the full verification set used during development:
+
+```bash
+cargo fmt --all --check
+cargo check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## Live acceptance tests
+
+Live swarm tests are available, but they are ignored by default.
+
+Set one or more environment variables:
+
+```bash
+export RS_TORRENT_LIVE_TORRENT='<torrent-file-or-url>'
+export RS_TORRENT_LIVE_MAGNET='magnet:?xt=urn:btih:...'
+export RS_TORRENT_LIVE_RESUME_SOURCE='<torrent-or-magnet-source>'
+```
+
+Run the ignored live suite:
 
 ```bash
 cargo test --test live_acceptance -- --ignored
@@ -138,8 +149,6 @@ cargo test --test live_acceptance -- --ignored
 
 ## Current limitations
 
-- piece availability is sampled from startup bitfields, but live `have` traffic is only partially exploited
-- no daemonized/background mode yet
-- no selective file download yet
-- live-swarm validation is opt-in, not part of the default test path
+Piece availability is sampled from peer bitfields at startup and updated from some peer state changes, but it is not yet a fully adaptive production scheduler.
 
+Live-swarm validation is opt-in rather than part of the default local test path.
