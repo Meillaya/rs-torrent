@@ -1,11 +1,10 @@
-use std::fmt;
-use std::io;
-use url;
+use reqwest;
 use serde_bencode;
 use serde_json;
-use reqwest;
-use serde_urlencoded;
+use std::fmt;
+use std::io;
 use tokio::sync::broadcast::error::SendError;
+use url;
 pub type Result<T> = std::result::Result<T, TorrentError>;
 
 #[derive(Debug)]
@@ -18,7 +17,6 @@ pub enum TorrentError {
         found: &'static str,
     },
     Reqwest(reqwest::Error),
-    UrlEncoding(serde_urlencoded::ser::Error),
     InvalidResponseFormat(String),
     UrlParse(url::ParseError),
     Json(serde_json::Error),
@@ -43,18 +41,19 @@ pub enum TorrentError {
     ConnectionTimeout,
 }
 
-
 impl fmt::Display for TorrentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TorrentError::Io(e) => write!(f, "IO Error: {}", e),
             TorrentError::Bencode(e) => write!(f, "Bencode Error: {}", e),
             TorrentError::MissingKey(key) => write!(f, "Missing Key: {}", key),
-            TorrentError::UnexpectedType { expected, found } => 
-                write!(f, "Unexpected Type: expected {}, found {}", expected, found),
+            TorrentError::UnexpectedType { expected, found } => {
+                write!(f, "Unexpected Type: expected {}, found {}", expected, found)
+            }
             TorrentError::Reqwest(e) => write!(f, "HTTP Request Error: {}", e),
-            TorrentError::UrlEncoding(e) => write!(f, "URL Encoding Error: {}", e),
-            TorrentError::InvalidResponseFormat(msg) => write!(f, "Invalid Response Format: {}", msg),
+            TorrentError::InvalidResponseFormat(msg) => {
+                write!(f, "Invalid Response Format: {}", msg)
+            }
             TorrentError::UrlParse(e) => write!(f, "URL Parse Error: {}", e),
             TorrentError::Json(e) => write!(f, "JSON Error: {}", e),
             TorrentError::Tracker(e) => write!(f, "Tracker Error: {}", e),
@@ -69,13 +68,15 @@ impl fmt::Display for TorrentError {
             TorrentError::DownloadFailed(msg) => write!(f, "Download Failed: {}", msg),
             TorrentError::InvalidMagnetLink => write!(f, "Invalid Magnet Link"),
             TorrentError::ChannelSendError(msg) => write!(f, "Channel Send Error: {}", msg),
-            TorrentError::MetadataExtensionNotSupported => write!(f, "Metadata Extension Not Supported"),
+            TorrentError::MetadataExtensionNotSupported => {
+                write!(f, "Metadata Extension Not Supported")
+            }
             TorrentError::InvalidMetadataResponse => write!(f, "Invalid Metadata Response"),
             TorrentError::MetadataSizeNotFound => write!(f, "Metadata Size Not Found"),
             TorrentError::MetadataRejected => write!(f, "Metadata Rejected"),
-            TorrentError::IncompleteMetadata=> write!(f, "Incomplete Metadata"),
-            TorrentError::ConnectionClosed=> write!(f, "Connection Closed"),
-            TorrentError::ConnectionTimeout=> write!(f, "Connection Timeout"),
+            TorrentError::IncompleteMetadata => write!(f, "Incomplete Metadata"),
+            TorrentError::ConnectionClosed => write!(f, "Connection Closed"),
+            TorrentError::ConnectionTimeout => write!(f, "Connection Timeout"),
         }
     }
 }
@@ -86,7 +87,6 @@ impl std::error::Error for TorrentError {
             TorrentError::Io(e) => Some(e),
             TorrentError::Bencode(e) => Some(e),
             TorrentError::Reqwest(e) => Some(e),
-            TorrentError::UrlEncoding(e) => Some(e),
             TorrentError::UrlParse(e) => Some(e),
             TorrentError::Json(e) => Some(e),
             _ => None,
@@ -115,12 +115,6 @@ impl From<serde_bencode::Error> for TorrentError {
 impl From<reqwest::Error> for TorrentError {
     fn from(err: reqwest::Error) -> Self {
         TorrentError::Reqwest(err)
-    }
-}
-
-impl From<serde_urlencoded::ser::Error> for TorrentError {
-    fn from(err: serde_urlencoded::ser::Error) -> Self {
-        TorrentError::UrlEncoding(err)
     }
 }
 

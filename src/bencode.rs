@@ -79,6 +79,47 @@ pub fn encode_dict(dict: &HashMap<Vec<u8>, Value>) -> Result<Vec<u8>> {
     encode(&Value::Dict(dict.clone()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{decode_dict, decode_integer, decode_string, encode_integer, encode_string};
+    use crate::error::TorrentError;
+
+    #[test]
+    fn round_trips_strings_and_integers() {
+        let encoded_string = encode_string("hello").expect("string should encode");
+        let encoded_int = encode_integer(42).expect("integer should encode");
+
+        assert_eq!(
+            decode_string(&encoded_string).expect("string should decode"),
+            "hello"
+        );
+        assert_eq!(decode_integer(&encoded_int).expect("int should decode"), 42);
+    }
+
+    #[test]
+    fn reports_type_mismatches() {
+        let err = decode_integer(b"5:hello").expect_err("string is not an integer");
+
+        assert!(matches!(
+            err,
+            TorrentError::UnexpectedType {
+                expected: "integer",
+                found: "non-integer"
+            }
+        ));
+    }
+
+    #[test]
+    fn decodes_dictionaries() {
+        let dict = decode_dict(b"d3:cow3:moo4:spam4:eggse").expect("dict should decode");
+
+        assert_eq!(dict.len(), 2);
+        assert_eq!(
+            dict.get(b"cow".as_slice()).expect("cow key should exist"),
+            &serde_bencode::value::Value::Bytes(b"moo".to_vec())
+        );
+    }
+}
 
 // Helper functions for working with dictionaries
 // pub fn get_bytes_from_dict(dict: &HashMap<Vec<u8>, Value>, key: &[u8]) -> Result<Vec<u8>> {

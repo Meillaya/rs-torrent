@@ -1,0 +1,359 @@
+use crate::{
+    error::{Result, TorrentError},
+    torrent::{self, TorrentInfo},
+};
+use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+pub struct DownloadStorage {
+    output_path: PathBuf,
+    part_path: PathBuf,
+    state_path: PathBuf,
+    file: File,
+    state: ResumeState,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResumeState {
+    info_hash: String,
+    piece_length: i64,
+    total_length: i64,
+    completed_pieces: Vec<bool>,
+}
+
+impl DownloadStorage {
+    pub async fn open<P: AsRef<Path>>(output_path: P, info: &TorrentInfo) -> Result<Self> {
+        let output_path = output_path.as_ref().to_path_buf();
+        let part_path = append_suffix(&output_path, ".part");
+        let state_path = append_suffix(&output_path, ".resume.json");
+
+        if fs::try_exists(&output_path).await?
+            && !fs::try_exists(&part_path).await?
+            && !fs::try_exists(&state_path).await?
+        {
+            return Err(TorrentError::DownloadFailed(format!(
+                "Output path already exists: {}",
+                output_path.display()
+            )));
+        }
+
+        if !self_describes_torrent(info) {
+            return Err(TorrentError::DownloadFailed(
+                "Torrent metadata is incomplete for storage initialization".into(),
+            ));
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&part_path)
+            .await?;
+        file.set_len(info.length as u64).await?;
+
+        let mut storage = Self {
+            output_path,
+            part_path,
+            state_path,
+            file,
+            state: ResumeState::new(info),
+        };
+
+        storage.load_or_initialize_state(info).await?;
+        storage.reconcile_completed_pieces(info).await?;
+        storage.persist_state().await?;
+
+        Ok(storage)
+    }
+
+    pub fn missing_piece_indices(&self) -> Vec<usize> {
+        self.state
+            .completed_pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, completed)| (!completed).then_some(index))
+            .collect()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.state
+            .completed_pieces
+            .iter()
+            .all(|completed| *completed)
+    }
+
+    pub fn completed_piece_count(&self) -> usize {
+        self.state
+            .completed_pieces
+            .iter()
+            .filter(|completed| **completed)
+            .count()
+    }
+
+    pub fn total_piece_count(&self) -> usize {
+        self.state.completed_pieces.len()
+    }
+
+    pub async fn write_piece(
+        &mut self,
+        info: &TorrentInfo,
+        piece_index: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        if !torrent::verify_piece(info, piece_index, data) {
+            return Err(TorrentError::PieceVerificationFailed);
+        }
+
+        let expected_len = piece_length_for(info, piece_index)?;
+        if data.len() != expected_len {
+            return Err(TorrentError::UnexpectedBlockData);
+        }
+
+        self.seek_to_piece(info, piece_index).await?;
+        self.file.write_all(data).await?;
+        self.file.flush().await?;
+
+        self.state.completed_pieces[piece_index] = true;
+        self.persist_state().await?;
+        Ok(())
+    }
+
+    pub async fn finalize(mut self) -> Result<()> {
+        if !self.is_complete() {
+            return Err(TorrentError::DownloadFailed(
+                "Cannot finalize incomplete download".into(),
+            ));
+        }
+
+        self.file.flush().await?;
+        drop(self.file);
+
+        if fs::try_exists(&self.output_path).await? {
+            return Err(TorrentError::DownloadFailed(format!(
+                "Refusing to overwrite existing file: {}",
+                self.output_path.display()
+            )));
+        }
+
+        fs::rename(&self.part_path, &self.output_path).await?;
+        if fs::try_exists(&self.state_path).await? {
+            fs::remove_file(&self.state_path).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_or_initialize_state(&mut self, info: &TorrentInfo) -> Result<()> {
+        if !fs::try_exists(&self.state_path).await? {
+            self.state = ResumeState::new(info);
+            return Ok(());
+        }
+
+        let raw_state = fs::read(&self.state_path).await?;
+        let persisted: ResumeState = serde_json::from_slice(&raw_state)?;
+        if persisted.matches(info) {
+            self.state = persisted;
+        } else {
+            self.state = ResumeState::new(info);
+            self.file.set_len(info.length as u64).await?;
+            self.file.seek(std::io::SeekFrom::Start(0)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn reconcile_completed_pieces(&mut self, info: &TorrentInfo) -> Result<()> {
+        for piece_index in 0..self.state.completed_pieces.len() {
+            if !self.state.completed_pieces[piece_index] {
+                continue;
+            }
+
+            let piece = self.read_piece(info, piece_index).await?;
+            if !torrent::verify_piece(info, piece_index, &piece) {
+                self.state.completed_pieces[piece_index] = false;
+                self.zero_piece(info, piece_index).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn read_piece(&mut self, info: &TorrentInfo, piece_index: usize) -> Result<Vec<u8>> {
+        let length = piece_length_for(info, piece_index)?;
+        self.seek_to_piece(info, piece_index).await?;
+        let mut buffer = vec![0u8; length];
+        self.file.read_exact(&mut buffer).await?;
+        Ok(buffer)
+    }
+
+    async fn zero_piece(&mut self, info: &TorrentInfo, piece_index: usize) -> Result<()> {
+        let length = piece_length_for(info, piece_index)?;
+        self.seek_to_piece(info, piece_index).await?;
+        self.file.write_all(&vec![0u8; length]).await?;
+        self.file.flush().await?;
+        Ok(())
+    }
+
+    async fn seek_to_piece(&mut self, info: &TorrentInfo, piece_index: usize) -> Result<()> {
+        let offset = piece_offset(info, piece_index)?;
+        self.file
+            .seek(std::io::SeekFrom::Start(offset as u64))
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_state(&self) -> Result<()> {
+        let encoded = serde_json::to_vec_pretty(&self.state)?;
+        fs::write(&self.state_path, encoded).await?;
+        Ok(())
+    }
+}
+
+impl ResumeState {
+    fn new(info: &TorrentInfo) -> Self {
+        Self {
+            info_hash: info.info_hash.clone(),
+            piece_length: info.piece_length,
+            total_length: info.length,
+            completed_pieces: vec![false; info.pieces.len()],
+        }
+    }
+
+    fn matches(&self, info: &TorrentInfo) -> bool {
+        self.info_hash == info.info_hash
+            && self.piece_length == info.piece_length
+            && self.total_length == info.length
+            && self.completed_pieces.len() == info.pieces.len()
+    }
+}
+
+fn self_describes_torrent(info: &TorrentInfo) -> bool {
+    info.length > 0 && info.piece_length > 0 && !info.pieces.is_empty()
+}
+
+fn piece_offset(info: &TorrentInfo, piece_index: usize) -> Result<usize> {
+    if piece_index >= info.pieces.len() {
+        return Err(TorrentError::InvalidResponseFormat(
+            "Invalid piece index".into(),
+        ));
+    }
+
+    Ok(piece_index * info.piece_length as usize)
+}
+
+fn piece_length_for(info: &TorrentInfo, piece_index: usize) -> Result<usize> {
+    if piece_index >= info.pieces.len() {
+        return Err(TorrentError::InvalidResponseFormat(
+            "Invalid piece index".into(),
+        ));
+    }
+
+    if piece_index == info.pieces.len() - 1 {
+        Ok(info.length as usize - (info.pieces.len() - 1) * info.piece_length as usize)
+    } else {
+        Ok(info.piece_length as usize)
+    }
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
+    path.push(OsString::from(suffix));
+    PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DownloadStorage;
+    use crate::torrent::TorrentInfo;
+    use sha1::{Digest, Sha1};
+    use tempfile::tempdir;
+
+    fn fake_info() -> TorrentInfo {
+        let piece_a = b"abcd";
+        let piece_b = b"efgh";
+
+        TorrentInfo {
+            announce: String::new(),
+            info_hash: "fake-info-hash".into(),
+            length: 8,
+            name: "fixture.bin".into(),
+            piece_length: 4,
+            pieces: vec![sha1_bytes(piece_a), sha1_bytes(piece_b)],
+        }
+    }
+
+    fn sha1_bytes(bytes: &[u8]) -> [u8; 20] {
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        hasher.finalize().into()
+    }
+
+    #[tokio::test]
+    async fn resumes_completed_pieces_and_finalizes() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output = dir.path().join("download.bin");
+        let info = fake_info();
+
+        let mut storage = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should open");
+        assert_eq!(storage.missing_piece_indices(), vec![0, 1]);
+
+        storage
+            .write_piece(&info, 0, b"abcd")
+            .await
+            .expect("piece should write");
+        assert_eq!(storage.missing_piece_indices(), vec![1]);
+        drop(storage);
+
+        let mut resumed = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should reopen");
+        assert_eq!(resumed.missing_piece_indices(), vec![1]);
+        resumed
+            .write_piece(&info, 1, b"efgh")
+            .await
+            .expect("second piece should write");
+        resumed.finalize().await.expect("download should finalize");
+
+        let final_bytes = tokio::fs::read(&output)
+            .await
+            .expect("final output should exist");
+        assert_eq!(&final_bytes, b"abcdefgh");
+        assert!(!output.with_extension("bin.part").exists());
+        assert!(!output.with_extension("bin.resume.json").exists());
+    }
+
+    #[tokio::test]
+    async fn invalidates_corrupted_completed_pieces_on_resume() {
+        let dir = tempdir().expect("tempdir should exist");
+        let output = dir.path().join("download.bin");
+        let info = fake_info();
+
+        let mut storage = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should open");
+        storage
+            .write_piece(&info, 0, b"abcd")
+            .await
+            .expect("piece should write");
+        drop(storage);
+
+        let part_path = std::path::PathBuf::from(format!("{}.part", output.display()));
+        let mut bytes = tokio::fs::read(&part_path)
+            .await
+            .expect("part file should exist");
+        bytes[0] = b'Z';
+        tokio::fs::write(&part_path, bytes)
+            .await
+            .expect("part file should rewrite");
+
+        let resumed = DownloadStorage::open(&output, &info)
+            .await
+            .expect("storage should reopen");
+        assert_eq!(resumed.missing_piece_indices(), vec![0, 1]);
+    }
+}

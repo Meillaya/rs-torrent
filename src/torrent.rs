@@ -18,14 +18,11 @@ pub struct Torrent {
 
 impl Torrent {
     pub fn info_hash(&self) -> [u8; 20] {
-        let info_encoded =
-            serde_bencode::ser::to_bytes(&self.info).expect("Re-encode info section should be fine");
+        let info_encoded = serde_bencode::ser::to_bytes(&self.info)
+            .expect("Re-encode info section should be fine");
         let mut hasher = Sha1::new();
         hasher.update(&info_encoded);
-        hasher
-            .finalize()
-            .try_into()
-            .expect("Hash output should be 20 bytes")
+        hasher.finalize().into()
     }
 }
 
@@ -42,9 +39,7 @@ pub struct Info {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Keys {
-    SingleFile {
-        length: usize,
-    },
+    SingleFile { length: usize },
     MultiFile { files: Vec<File> },
 }
 
@@ -76,7 +71,7 @@ mod hashes {
         where
             E: de::Error,
         {
-            if v.len() % 20 != 0 {
+            if !v.len().is_multiple_of(20) {
                 return Err(E::custom(format!("length is {}", v.len())));
             }
 
@@ -125,14 +120,13 @@ pub struct TorrentInfo {
 }
 
 impl TorrentInfo {
-
     pub fn calculate_info_hash(info: &Info) -> [u8; 20] {
         let info_encoded = serde_bencode::to_bytes(info).expect("Failed to encode info dictionary");
         let mut hasher = Sha1::new();
         hasher.update(&info_encoded);
-        hasher.finalize().try_into().expect("Hash output should be 20 bytes")
+        hasher.finalize().into()
     }
-    
+
     pub fn calculate_length(info: &Info) -> i64 {
         match &info.keys {
             Keys::SingleFile { length } => *length as i64,
@@ -162,7 +156,7 @@ impl TorrentInfo {
             info_hash: magnet.info_hash.clone(),
             length: 0, // Length is unknown from magnet link
             name: magnet.display_name.clone().unwrap_or_default(),
-            piece_length: 0, // Unknown from magnet link
+            piece_length: 0,    // Unknown from magnet link
             pieces: Vec::new(), // Unknown from magnet link
         })
     }
@@ -199,5 +193,70 @@ pub fn verify_piece(info: &TorrentInfo, piece_index: usize, piece_data: &[u8]) -
         expected_hash == actual_hash.as_slice()
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_file, get_info, verify_piece, Keys, TorrentInfo};
+
+    fn sample_torrent_path() -> String {
+        format!("{}/sample.torrent", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn decodes_sample_torrent_fixture() {
+        let torrent = decode_file(&sample_torrent_path()).expect("sample torrent should decode");
+
+        assert_eq!(
+            torrent.announce,
+            "http://bittorrent-test-tracker.codecrafters.io/announce"
+        );
+        assert_eq!(torrent.info.name, "sample.txt");
+        assert_eq!(torrent.info.pieces.0.len(), 3);
+        assert!(matches!(
+            torrent.info.keys,
+            Keys::SingleFile { length: 92063 }
+        ));
+    }
+
+    #[test]
+    fn derives_sample_torrent_info() {
+        let info = get_info(&sample_torrent_path()).expect("sample torrent info should load");
+
+        assert_eq!(info.info_hash, "d69f91e6b2ae4c542468d1073a71d4ea13879a7f");
+        assert_eq!(info.length, 92063);
+        assert_eq!(info.piece_length, 32768);
+        assert_eq!(info.pieces.len(), 3);
+    }
+
+    #[test]
+    fn rejects_invalid_piece_data() {
+        let info = get_info(&sample_torrent_path()).expect("sample torrent info should load");
+
+        assert!(!verify_piece(&info, 0, b"not the correct piece"));
+    }
+
+    #[test]
+    fn calculates_lengths_for_multi_file_metadata() {
+        let info = super::Info {
+            name: "bundle".into(),
+            piece_length: 16384,
+            pieces: super::Hashes(vec![[0u8; 20]]),
+            keys: Keys::MultiFile {
+                files: vec![
+                    super::File {
+                        length: 10,
+                        path: vec!["a".into()],
+                    },
+                    super::File {
+                        length: 15,
+                        path: vec!["b".into()],
+                    },
+                ],
+            },
+        };
+
+        assert_eq!(TorrentInfo::calculate_length(&info), 25);
     }
 }
